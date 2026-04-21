@@ -94,7 +94,8 @@ class StandardModel(EasySyntax):
         # Member variable(s)
         self._data_representation = data_representation
         self.backbone = backbone
-
+        self._split_sizes = None
+        
         if split is not None:
             self._split_sizes = split[0]
             self._split_indices = split[1]
