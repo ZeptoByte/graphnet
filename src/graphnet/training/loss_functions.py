@@ -311,7 +311,6 @@ class FocalCrossEntropyLoss(LossFunction):
         p_t = torch.exp(-cross_loss)
         return (1-p_t)**self._gamma*cross_loss
 
-
 class BinaryCrossEntropyLoss(LossFunction):
     """Compute binary cross entropy loss.
 
@@ -320,11 +319,13 @@ class BinaryCrossEntropyLoss(LossFunction):
     """
 
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        print('pred', prediction.float())
+        print('target', target.float())
         return binary_cross_entropy(
             prediction.float(), target.float(), reduction="none"
         )
     
-class FocalBinaryCrossEntropyLoss(LossFunction):
+class AsymmetricFocalBinaryCrossEntropyLoss(LossFunction):
     """Compute binary cross entropy loss.
 
     Predictions are vector probabilities (i.e., values between 0 and 1), and
@@ -333,9 +334,9 @@ class FocalBinaryCrossEntropyLoss(LossFunction):
 
     def __init__(
         self,
-        options: Union[int, List[Any], Dict[Any, int]],
         ratio: float = 1,
-        gamma: float = 2,
+        gamma_plus: float = 0,
+        gamma_minus: float = 2,
         alpha: float = 1,
         *args: Any,
         **kwargs: Any,
@@ -344,16 +345,25 @@ class FocalBinaryCrossEntropyLoss(LossFunction):
         # Base class constructor
         super().__init__(*args, **kwargs)
 
-        self._gamma = gamma
+        self._gamma_plus = gamma_plus
+        self._gamma_minus = gamma_minus
         self._alpha = alpha
 
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        
         binary_loss = binary_cross_entropy(
             prediction.float(), target.float(), reduction="none", 
         )
         a_t = self._alpha*target + (1-self._alpha)*(1-target)
         p_t = prediction*target + (1-prediction)*(1-target)
-        return a_t*(1-p_t)**self._gamma*binary_loss
+        gamma = self._gamma_plus*target + self._gamma_minus*(1-target)
+        #print('target', target.float())
+        #print('prediction', prediction.float())
+        #print('gamma', gamma)
+        #print('binary_loss', binary_loss)
+        #print('focal_loss', (1-p_t)**gamma*binary_loss)
+        #print('p_t', p_t)
+        return (1-p_t)**gamma*binary_loss
 
 
 class LogCMK(torch.autograd.Function):

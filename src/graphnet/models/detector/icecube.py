@@ -167,18 +167,23 @@ class IceCubeBundleAdvanced(Detector):
         time_charge_percentiles = [1,3,6,10,15,25,50,80]
         extra_features = [f'charge_after_{t}' for t in charge_after_t_threholds]
         extra_features_excl = [f'charge_after_{t}_excl' for t in charge_after_t_threholds]
+        extra_features_sat = [f'charge_after_{t}_sat' for t in charge_after_t_threholds]
         extra_features_percentiles = [f'time_charge_{p}' for p in time_charge_percentiles]
         extra_features_percentiles_excl = [f'time_charge_{p}_excl' for p in time_charge_percentiles]
+        extra_features_percentiles_sat = [f'time_charge_{p}_sat' for p in time_charge_percentiles]
 
         dict_extra_features = {feat: self._charge for feat in extra_features}
         dict_extra_features_excl = {feat: self._charge for feat in extra_features_excl}
+        dict_extra_features_sat = {feat: self._charge for feat in extra_features_sat}
         dict_extra_features_percentiles = {feat: self._adjusted_time for feat in extra_features_percentiles}
         dict_extra_features_percentiles_excl = {feat: self._adjusted_time for feat in extra_features_percentiles_excl}
-
+        dict_extra_features_percentiles_sat = {feat: self._adjusted_time for feat in extra_features_percentiles_sat}
         feature_map.update(dict_extra_features)
         feature_map.update(dict_extra_features_excl)
+        feature_map.update(dict_extra_features_sat)
         feature_map.update(dict_extra_features_percentiles)
         feature_map.update(dict_extra_features_percentiles_excl)
+        feature_map.update(dict_extra_features_percentiles_sat)
 
         return feature_map
 
