@@ -104,13 +104,15 @@ class DirectionReconstructionWithKappa(StandardLearnedTask):
     ]
     nb_inputs = 3
 
-    def __init__(self, *args, scaling=False, **kwargs):
+    def __init__(self, *args, scaling=False, sinh_scaling=False, **kwargs):
         """Initialise DirectionReconstruction.
 
         Args:
             scaling: Whether to apply scaling to kappa.
+            sinh_scaling: Whether to apply sinh scaling to kappa.
         """
         self.scaling = scaling
+        self.sinh_scaling = sinh_scaling
         super().__init__(*args, **kwargs)
 
     def _forward(self, x: Tensor) -> Tensor:
@@ -123,6 +125,8 @@ class DirectionReconstructionWithKappa(StandardLearnedTask):
 
         if self.scaling:
             kappa = kappa+kappa**2#torch.sinh(torch.clamp(kappa, max=15.0))
+        if self.sinh_scaling:
+            kappa = torch.sinh(torch.clamp(kappa, max=30.0))
         return torch.stack((vec_x, vec_y, vec_z, kappa), dim=1)
 
 
