@@ -9,6 +9,13 @@ from .i3featureextractor import (
     I3PulseNoiseTruthFlagIceCubeUpgrade,
 )
 
+from .i3fastextractor import (
+    I3FastExtractor,
+    I3FastExtractorIceCube86,
+    I3FastExtractorIceCubeDeepCore,
+    I3FastExtractorIceCubeUpgrade,
+)
+
 from .i3featureextractorlegacy import (
     I3FeatureExtractorLegacyIceCube,
     I3FeatureExtractorLegacyIceCube86,
