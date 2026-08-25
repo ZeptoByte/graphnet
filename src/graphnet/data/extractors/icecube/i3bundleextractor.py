@@ -164,6 +164,7 @@ class I3BundleExtractor(I3Extractor):
             "length_in_detector": padding_value,
             "length_in_detector_100": padding_value,
             "length_in_detector_200": padding_value,
+            'has_srtpulses': padding_value,
             "hitstrings": frame["NumberStrings"].value,
             "hitdoms": frame["NumberDOMs"].value,
             "hitstringsHLC": frame["NumberStringsHLC"].value,
@@ -171,6 +172,8 @@ class I3BundleExtractor(I3Extractor):
             # "flat_spectrum_weight": self._generation_spectrum_correction(frame),
         }
 
+        if 'SRTInIcePulses' in frame:
+            output['has_srtpulses'] = 1
         # Only InIceSplit P frames contain ML appropriate I3RecoPulseSeriesMap etc.
         # At low levels i3files contain several other P frame splits (e.g NullSplit),
         # we remove those here.

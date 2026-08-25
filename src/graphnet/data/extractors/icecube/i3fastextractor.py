@@ -16,7 +16,8 @@ class I3FastExtractor(I3Extractor):
 
     def __init__(self, 
         pulsemap: str, 
-        #exclude: list = [None],
+        exclude: list = [None],
+        training_data: bool = False,
         #exclude_saturation: bool = False,
         #exclude_calibration_errata: bool = False,
     ) -> None:
@@ -31,6 +32,7 @@ class I3FastExtractor(I3Extractor):
         self._pulsemap = pulsemap
         #self._exclude_saturation = exclude_saturation
         #self._exclude_calibration_errata = exclude_calibration_errata
+        self._training_data = training_data
 
         # Base class constructor
         super().__init__(pulsemap, exclude=exclude)
@@ -63,13 +65,34 @@ class I3FastExtractorIceCube86(I3FastExtractor):
             "is_bad_dom": [],
             "is_saturated_dom": [],
             "is_errata_dom": [],
-            "event_time": [],
+            #"event_time": [],
             "hlc": [],
             "awtd": [],
             "string": [],
-            "pmt_number": [],
+            #"pmt_number": [],
             "dom_number": [],
-            "dom_type": [],
+            #"dom_type": [],
+            "charge_after_10": [],
+            "charge_after_10_sat": [],
+            "charge_after_10_sat_no_errata": [],
+            "charge_after_25": [],
+            "charge_after_25_sat": [],
+            "charge_after_25_sat_no_errata": [],
+            "charge_after_50": [],
+            "charge_after_50_sat": [],
+            "charge_after_50_sat_no_errata": [],
+            "charge_after_100": [],
+            "charge_after_100_sat": [],
+            "charge_after_100_sat_no_errata": [],
+            "charge_after_250": [],
+            "charge_after_250_sat": [],
+            "charge_after_250_sat_no_errata": [],
+            "dom_qtot": [],
+            "dom_qtot_no_sat": [],
+            "dom_qtot_no_sat_no_errata": [],
+            "time_after_5": [],
+            "time_after_10": [],
+            "time_after_25": [],
         }
         # Get OM data
         if self._pulsemap in frame:
@@ -127,13 +150,18 @@ class I3FastExtractorIceCube86(I3FastExtractor):
             else:
                 is_bright_dom = int(padding_value)
 
+
             if bad_doms:
                 is_bad_dom = 1 if om_key in bad_doms else 0
             else:
                 is_bad_dom = int(padding_value)
 
+
             if is_bad_dom == 1:
                 continue  # Skip bad DOMs
+            
+            #output["is_bright_dom"].append(is_bright_dom)
+            output["is_bad_dom"].append(is_bad_dom)
 
             if saturation_windows:
                 is_saturated_dom = 1 if om_key in saturation_windows else 0
@@ -164,7 +192,8 @@ class I3FastExtractorIceCube86(I3FastExtractor):
             # Loop over pulses for each OM
             pulses = data[om_key]
 
-            min_pulse_time = getattr(pulses[0], "time", padding_value) 
+            min_pulse_time = getattr(pulses[0], "time", padding_value)
+            output["width"].append(getattr(pulses[0], "width", padding_value))
 
             output['dom_time'].append(min_pulse_time)
             output['dom_x'].append(x)
@@ -178,34 +207,40 @@ class I3FastExtractorIceCube86(I3FastExtractor):
             dom_qtot_no_sat = 0
             dom_qtot_no_sat_no_errata = 0
 
-            flags = getattr(pulse, "flags", padding_value)
+            flags = getattr(pulses[0], "flags", padding_value)
             if flags == padding_value:
                 output["hlc"].append(padding_value)
                 output["awtd"].append(padding_value)
             else:
-                output["hlc"].append((pulse.flags >> 0) & 0x1)  # bit 0
-                output["awtd"].append(self._parse_awtd_flag(pulse))
+                output["hlc"].append((pulses[0].flags >> 0) & 0x1)  # bit 0
+                output["awtd"].append(self._parse_awtd_flag(pulses[0]))
+
+            output['charge_after_10'].append(dom_qtot)
+            output['charge_after_10_sat'].append(dom_qtot_no_sat)
+            output['charge_after_10_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
+            output['charge_after_25'].append(dom_qtot)
+            output['charge_after_25_sat'].append(dom_qtot_no_sat)
+            output['charge_after_25_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
+            output['charge_after_50'].append(dom_qtot)
+            output['charge_after_50_sat'].append(dom_qtot_no_sat)
+            output['charge_after_50_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
+            output['charge_after_100'].append(dom_qtot)
+            output['charge_after_100_sat'].append(dom_qtot_no_sat)
+            output['charge_after_100_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
+            output['charge_after_250'].append(dom_qtot)
+            output['charge_after_250_sat'].append(dom_qtot_no_sat)
+            output['charge_after_250_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
+
+            output['time_after_5'].append(0)
+            output['time_after_10'].append(0)
+            output['time_after_25'].append(0)
+
             for pulse in pulses:
                 
                 pulse_time = getattr(pulse, "time", padding_value)
                 time_since_first_pulse = pulse_time - min_pulse_time
-                if time_since_first_pulse > 10:
-                    output['charge_after_10'].append(dom_qtot)
-                    output['charge_after_10_sat'].append(dom_qtot_no_sat)
-                    output['charge_after_10_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
-
-                if time_since_first_pulse > 25:
-                    output['charge_after_25'].append(dom_qtot)
-                    output['charge_after_25_sat'].append(dom_qtot_no_sat)
-                    output['charge_after_25_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
-
-                
-                if time_since_first_pulse > 50:
-                    output['charge_after_50'].append(dom_qtot)
-                    output['charge_after_50_sat'].append(dom_qtot_no_sat)
-                    output['charge_after_50_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
-
                 charge = getattr(pulse, "charge", padding_value)
+
                 if is_saturated_dom == 1 and saturation_start <= pulse_time <= saturation_stop:
                     is_saturated_pulse = 1
                 else:
@@ -214,21 +249,65 @@ class I3FastExtractorIceCube86(I3FastExtractor):
                     is_errata_pulse = 1
                 else:
                     is_errata_pulse = 0
-                
-                dom_qtot += getattr(pulse, "charge", padding_value)
+
+                dom_qtot += charge
                 if is_saturated_pulse == 0:                
-                    dom_qtot_no_sat += getattr(pulse, "charge", padding_value)
+                    dom_qtot_no_sat += charge
                 if is_saturated_pulse == 0 and is_errata_pulse == 0:
-                    dom_qtot_no_sat_no_errata += getattr(pulse, "charge", padding_value)
+                    dom_qtot_no_sat_no_errata += charge
+
+                if time_since_first_pulse <= 10:
+                    output['charge_after_10'][-1] = dom_qtot
+                    output['charge_after_10_sat'][-1] = dom_qtot_no_sat
+                    output['charge_after_10_sat_no_errata'][-1] = dom_qtot_no_sat_no_errata
+
+                if time_since_first_pulse <= 25:
+                    output['charge_after_25'][-1] = dom_qtot
+                    output['charge_after_25_sat'][-1] = dom_qtot_no_sat
+                    output['charge_after_25_sat_no_errata'][-1] = dom_qtot_no_sat_no_errata
+
+                if time_since_first_pulse <= 50:
+                    output['charge_after_50'][-1] = dom_qtot
+                    output['charge_after_50_sat'][-1] = dom_qtot_no_sat
+                    output['charge_after_50_sat_no_errata'][-1] = dom_qtot_no_sat_no_errata
+
+                if time_since_first_pulse <= 100:
+                    output['charge_after_100'][-1] = dom_qtot
+                    output['charge_after_100_sat'][-1] = dom_qtot_no_sat
+                    output['charge_after_100_sat_no_errata'][-1] = dom_qtot_no_sat_no_errata
+
+                if time_since_first_pulse <= 250:
+                    output['charge_after_250'][-1] = dom_qtot
+                    output['charge_after_250_sat'][-1] = dom_qtot_no_sat
+                    output['charge_after_250_sat_no_errata'][-1] = dom_qtot_no_sat_no_errata
+
+                if dom_qtot <= 5:
+                    output['time_after_5'][-1] = time_since_first_pulse
+                if dom_qtot <= 10:
+                    output['time_after_10'][-1] = time_since_first_pulse
+                if dom_qtot <= 25:
+                    output['time_after_25'][-1] = time_since_first_pulse
             
             output['dom_qtot'].append(dom_qtot)
             output['dom_qtot_no_sat'].append(dom_qtot_no_sat)
             output['dom_qtot_no_sat_no_errata'].append(dom_qtot_no_sat_no_errata)
-            output["event_time"].append(event_time)
+            #output["event_time"].append(event_time)
             output["string"].append(string)
-            output["pmt_number"].append(pmt_number)
+            #output["pmt_number"].append(pmt_number)
             output["dom_number"].append(dom_number)
-            output["dom_type"].append(dom_type)
+            #output["dom_type"].append(dom_type)
+
+            if dom_qtot >= 2*frame['HQTOT'].value:
+                output['is_bright_dom'].append(1)
+            else:
+                output['is_bright_dom'].append(0)
+
+        if self._training_data:
+            frame['NumberStrings'] = icetray.I3Int(len(set(output["string"])))
+            frame['NumberDOMs'] = icetray.I3Int(len(output["dom_number"]))
+            frame['NumberStringsHLC'] = icetray.I3Int(len(set([s for s, h in zip(output["string"], output["hlc"]) if h == 1])))
+            frame['NumberDOMsHLC'] = icetray.I3Int(len([h for h in output["hlc"] if h == 1]))
+
         return output
 
     def _get_relative_dom_efficiency(
