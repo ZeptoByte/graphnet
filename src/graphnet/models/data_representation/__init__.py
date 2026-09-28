@@ -14,6 +14,7 @@ from .graphs import (
     KNNGraphRWSE,
     NodeDefinition,
     NodesAsPulses,
+    NodesAsPulsesBundle,
     PercentileClusters,
     NodeAsDOMTimeSeries,
     IceMixNodes,
