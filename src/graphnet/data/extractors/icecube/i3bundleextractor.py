@@ -110,8 +110,11 @@ class I3BundleExtractor(I3Extractor):
         """
 
         output = {
+            "primary_energy": padding_value,
             "azimuth": padding_value,
             "zenith": padding_value,
+            "leading_azimuth": padding_value,
+            "leading_zenith": padding_value,
             "pid": padding_value,
             "event_time": frame["I3EventHeader"].start_time.utc_daq_time,
             "interaction_type": padding_value,
@@ -127,7 +130,7 @@ class I3BundleExtractor(I3Extractor):
             "topology_primary_low": padding_value,
             "topology_leading_high": padding_value,
             "topology_leading_low": padding_value,
-            "charge": frame["HQTOT"].value,
+            "charge": padding_value,
             "fraction_coincidence": padding_value,
             "muon_multiplicity": padding_value,
             "muon_multiplicity_cylinder": padding_value,
@@ -137,11 +140,11 @@ class I3BundleExtractor(I3Extractor):
             "deposited_muon_multiplicity_residual_charge": padding_value,
             "rms_closest_approach": padding_value,
             "rms_surface": padding_value,
-            "primary_rms_energy": padding_value,
-            "primary_rms3_energy": padding_value,
-            "primary_rms_MCPE": padding_value,
-            "primary_rms3_MCPE": padding_value,
-            "primary_most_lateral_deposit": padding_value,
+            #"primary_rms_energy": padding_value,
+            #"primary_rms3_energy": padding_value,
+            #"primary_rms_MCPE": padding_value,
+            #"primary_rms3_MCPE": padding_value,
+            #"primary_most_lateral_deposit": padding_value,
             "leading_rms_energy": padding_value,
             "leading_rms3_energy": padding_value,
             "leading_rms_MCPE": padding_value,
@@ -153,22 +156,22 @@ class I3BundleExtractor(I3Extractor):
             #"primary_stochasticity_std_MCPE": padding_value,
             #"primary_stochasticity_pomean_MCPE": padding_value,
             #"primary_stochasticity_pomedian_MCPE": padding_value,
-            #"leading_stochasticity_std_energy": padding_value,
-            #"leading_stochasticity_pomean_energy": padding_value,
-            #"leading_stochasticity_pomedian_energy": padding_value,
-            #"leading_stochasticity_std_MCPE": padding_value,
-            #"leading_stochasticity_pomean_MCPE": padding_value,
-            #"leading_stochasticity_pomedian_MCPE": padding_value,
-            "primary_length_deposited": padding_value,
+            "leading_stochasticity_std_energy": padding_value,
+            "leading_stochasticity_pomean_energy": padding_value,
+            "leading_stochasticity_pomedian_energy": padding_value,
+            "leading_stochasticity_std_MCPE": padding_value,
+            "leading_stochasticity_pomean_MCPE": padding_value,
+            "leading_stochasticity_pomedian_MCPE": padding_value,
+            #"primary_length_deposited": padding_value,
             "leading_length_deposited": padding_value,
             "length_in_detector": padding_value,
             "length_in_detector_100": padding_value,
             "length_in_detector_200": padding_value,
             'has_srtpulses': padding_value,
-            "hitstrings": frame["NumberStrings"].value,
-            "hitdoms": frame["NumberDOMs"].value,
-            "hitstringsHLC": frame["NumberStringsHLC"].value,
-            "hitdomsHLC": frame["NumberDOMsHLC"].value,
+            "hitstrings": padding_value,
+            "hitdoms": padding_value,
+            "hitstringsHLC": padding_value,
+            "hitdomsHLC": padding_value,
             # "flat_spectrum_weight": self._generation_spectrum_correction(frame),
         }
 
@@ -182,6 +185,19 @@ class I3BundleExtractor(I3Extractor):
             "Final",
         ]:
             return output
+
+        # NumberStrings etc. are written by I3FastExtractor (training_data)
+        output.update(
+            {
+                "charge": (
+                    frame["HQTOT"].value if "HQTOT" in frame else padding_value
+                ),
+                "hitstrings": frame["NumberStrings"].value,
+                "hitdoms": frame["NumberDOMs"].value,
+                "hitstringsHLC": frame["NumberStringsHLC"].value,
+                "hitdomsHLC": frame["NumberDOMsHLC"].value,
+            }
+        )
 
         """
         Gather Basic Event Information
@@ -199,8 +215,8 @@ class I3BundleExtractor(I3Extractor):
                 "primary_energy": primary_particle.energy,
                 "azimuth": primary.dir.azimuth,
                 "zenith": primary.dir.zenith,
-                # "azi_leading": leading.dir.azimuth, # Azimuth of the Highest Energy Charged Lepton in Event
-                # "zen_leading": leading.dir.zenith, # Zenith of the Highest Energy Charged Lepton in Event
+                "leading_azimuth": leading.dir.azimuth,  # Highest energy in-ice muon (CORSIKA) / end of neutrino first-child chain (NuGen)
+                "leading_zenith": leading.dir.zenith,
                 "pid": primary_particle.pdg_encoding,
                 "interaction_type": interaction_type,
             }
@@ -236,11 +252,11 @@ class I3BundleExtractor(I3Extractor):
             {
                 "rms_closest_approach": frame["rms_closest_approach"].value,
                 "rms_surface": frame["rms_surface"].value,
-                "primary_rms_energy": frame['PrimaryShowerProfile_energy']['lateral_rms'],
-                "primary_rms3_energy": frame['PrimaryShowerProfile_energy']['lateral_rms3'],
-                "primary_rms_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms'],
-                "primary_rms3_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms3'],
-                'primary_most_lateral_deposit': frame['PrimaryShowerProfile_MCPEs']['most_lateral_deposit'],
+                #"primary_rms_energy": frame['PrimaryShowerProfile_energy']['lateral_rms'],
+                #"primary_rms3_energy": frame['PrimaryShowerProfile_energy']['lateral_rms3'],
+                #"primary_rms_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms'],
+                #"primary_rms3_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms3'],
+                #'primary_most_lateral_deposit': frame['PrimaryShowerProfile_MCPEs']['most_lateral_deposit'],
                 "leading_rms_energy": frame['LeadingShowerProfile_energy']['lateral_rms'],
                 "leading_rms3_energy": frame['LeadingShowerProfile_energy']['lateral_rms3'],
                 "leading_rms_MCPE": frame['LeadingShowerProfile_MCPEs']['lateral_rms'],
@@ -252,13 +268,13 @@ class I3BundleExtractor(I3Extractor):
                 #"primary_stochasticity_std_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_std'],
                 #"primary_stochasticity_pomean_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_ratio_above_mean'],
                 #"primary_stochasticity_pomedian_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_ratio_above_median'],
-                #"leading_stochasticity_std_energy": frame['LeadingShowerProfile_energy']['stochasticity_std'],
-                #"leading_stochasticity_pomean_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_mean'],
-                #"leading_stochasticity_pomedian_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_median'],
-                #"leading_stochasticity_std_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_std'],
-                #"leading_stochasticity_pomean_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_mean'],
-                #"leading_stochasticity_pomedian_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_median'],
-                "primary_length_deposited": frame['ShowerLengthDeposited']['primary_length_deposited'],
+                "leading_stochasticity_std_energy": frame['LeadingShowerProfile_energy']['stochasticity_std'],
+                "leading_stochasticity_pomean_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_mean'],
+                "leading_stochasticity_pomedian_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_median'],
+                "leading_stochasticity_std_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_std'],
+                "leading_stochasticity_pomean_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_mean'],
+                "leading_stochasticity_pomedian_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_median'],
+                #"primary_length_deposited": frame['ShowerLengthDeposited']['primary_length_deposited'],
                 "leading_length_deposited": frame['ShowerLengthDeposited']['leading_length_deposited'],
                 "fraction_coincidence": frame['fraction_coincidence'].value,
             }
@@ -359,10 +375,10 @@ class I3BundleExtractor(I3Extractor):
                 starting_metrics[0], starting_metrics[2], is_skimming_event
             ),
             "topology_leading_high": self._label_topologies(
-                starting_metrics[0], starting_metrics[2], is_skimming_event
+                starting_metrics[0], starting_metrics[3], is_skimming_event
             ),
             "topology_leading_low": self._label_topologies(
-                starting_metrics[0], starting_metrics[3], is_skimming_event
+                starting_metrics[0], starting_metrics[4], is_skimming_event
             ),
             "length_in_detector": frame["TrackLength_Inside_Detector"].value,
             "length_in_detector_100": frame[
@@ -389,10 +405,10 @@ class I3BundleExtractor(I3Extractor):
             topology = 1
         elif starting_inside & (starting_visible == True):
             topology = 12
-        elif starting_visible & (starting_inside == False):
-            topology = 2
         elif starting_visible & is_skimming:
             topology = 42
+        elif starting_visible & (starting_inside == False):
+            topology = 2
         elif (
             (starting_inside == False)
             & (starting_visible == False)

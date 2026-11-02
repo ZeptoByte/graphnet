@@ -15,6 +15,8 @@ import numpy as np
 import shapely.geometry as geom
 from collections import defaultdict
 
+from graphnet.data.extractors.icecube.utilities.frames import put_frame_key
+
 DEFAULT_GCD = "/cvmfs/icecube.opensciencegrid.org/data/GCD/GeoCalibDetectorStatus_2020.Run134142.Pass2_V0.i3.gz"
 
 
@@ -212,7 +214,7 @@ def closest_to_center(
         dom_z=0,
     )
 
-    frame["ClosestApproachPosition"] = dataclasses.I3Position(x_d, y_d, z_d)
+    put_frame_key(frame, "ClosestApproachPosition", dataclasses.I3Position(x_d, y_d, z_d))
 
 
 def compute_skimming_event(
@@ -251,12 +253,12 @@ def compute_skimming_event(
         int_one_200, int_two_200
     )
 
-    frame["TrackLength_Inside_Detector"] = dataclasses.I3Double(length)
-    frame["TrackLength_Near_Detector_100"] = dataclasses.I3Double(length_100)
-    frame["TrackLength_Near_Detector_200"] = dataclasses.I3Double(length_200)
-    frame["VetoLength_Inside_Detector"] = dataclasses.I3Double(veto_size)
-    frame["VetoLength_Near_Detector_100"] = dataclasses.I3Double(veto_size_100)
-    frame["VetoLength_Near_Detector_200"] = dataclasses.I3Double(veto_size_200)
+    put_frame_key(frame, "TrackLength_Inside_Detector", dataclasses.I3Double(length))
+    put_frame_key(frame, "TrackLength_Near_Detector_100", dataclasses.I3Double(length_100))
+    put_frame_key(frame, "TrackLength_Near_Detector_200", dataclasses.I3Double(length_200))
+    put_frame_key(frame, "VetoLength_Inside_Detector", dataclasses.I3Double(veto_size))
+    put_frame_key(frame, "VetoLength_Near_Detector_100", dataclasses.I3Double(veto_size_100))
+    put_frame_key(frame, "VetoLength_Near_Detector_200", dataclasses.I3Double(veto_size_200))
 
     closest_to_center(
         frame,
@@ -320,7 +322,7 @@ def indentify_interaction_vertex(
     while mctree.number_of_children(current) > 0:
         current = mctree.first_child(current)
 
-    frame["InteractionVertexParticle"] = current
+    put_frame_key(frame, "InteractionVertexParticle", current)
 
 
 def interaction_vertex_position(frame, leading_choice):
@@ -378,7 +380,7 @@ def is_starting_visible(
     r=250,
 ):
 
-    charge = frame["HQTOT"]
+    charge = frame["HQTOT"].value
     # Cut on 1 DOM within 250 meters of the dom
 
     df["pretex"] = df["s"] < int_vertex
@@ -426,12 +428,12 @@ def get_topology_metrics(
 
     # Convert to DOM Positions to Relative to the Track
     primary_df = add_closest_approach_vectors(
-        leading_lepton,
+        primary,
         dom_list.copy(),
     )
 
     leading_df = add_closest_approach_vectors(
-        primary,
+        leading_lepton,
         dom_list.copy(),
     )
 

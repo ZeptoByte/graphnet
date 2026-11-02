@@ -18,6 +18,17 @@ def frame_is_montecarlo(
     return ("MCInIcePrimary" in frame) or (mctree in frame)
 
 
+def put_frame_key(frame: "icetray.I3Frame", key: str, value: Any) -> None:
+    """Write `value` to `frame[key]`, replacing any existing entry.
+
+    I3Frame raises an error when assigning to a key that already exists,
+    e.g. if the input file already contains it.
+    """
+    if key in frame:
+        del frame[key]
+    frame[key] = value
+
+
 def frame_is_noise(
     frame: "icetray.I3Frame", mctree: Optional[str] = "I3MCTree"
 ) -> bool:

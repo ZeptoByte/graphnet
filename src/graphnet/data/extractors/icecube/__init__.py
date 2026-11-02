@@ -9,6 +9,10 @@ from .i3featureextractor import (
     I3PulseNoiseTruthFlagIceCubeUpgrade,
 )
 
+from .i3highesteparticleextractor import (
+    I3HighestEparticleExtractor,
+)
+
 from .i3fastextractor import (
     I3FastExtractor,
     I3FastExtractorIceCube86,

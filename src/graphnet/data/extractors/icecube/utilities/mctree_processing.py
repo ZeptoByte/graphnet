@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 from graphnet.data.extractors.icecube.utilities.vector_computations import (
     closest_approach_distance_vector,
 )
+from graphnet.data.extractors.icecube.utilities.frames import put_frame_key
 
 
 def get_leading_particle(
@@ -196,7 +197,7 @@ def turn_mcpe_into_light_sources(
     number_primaries = len(mc_tree.get_primaries())
 
     coincidence_hits = 0
-    for _, dom in enumerate(doms_hit_by_different_particles):
+    for dom in doms_hit_by_different_particles.items():
 
         for particle in dom[1].keys():
             dom_hits = dom[1][particle]
@@ -221,12 +222,12 @@ def turn_mcpe_into_light_sources(
     
     mcpe_information = pl.DataFrame(oms)
     if len(mcpe_information) == 0:
-        frame["fraction_coincidence"] = dataclasses.I3Double(1)
+        put_frame_key(frame, "fraction_coincidence", dataclasses.I3Double(1))
     else:
-        frame["fraction_coincidence"] = dataclasses.I3Double(
+        put_frame_key(frame, "fraction_coincidence", dataclasses.I3Double(
             coincidence_hits
             / (mcpe_information["MCPEs"].sum() + coincidence_hits)
-        )
+        ))
 
     return mcpe_information
 
@@ -334,9 +335,9 @@ def compute_training_labels(
         }
     )
 
-    frame[f"{leading_type}ShowerProfile_{information_type}"] = (
+    put_frame_key(frame, f"{leading_type}ShowerProfile_{information_type}", (
         dataclasses.I3MapStringDouble(dict_training)
-    )
+    ))
 
 
 def no_signal_hits(frame, information_type, leading_type="Primary"):
@@ -370,9 +371,9 @@ def no_signal_hits(frame, information_type, leading_type="Primary"):
         }
     )
 
-    frame[f"{leading_type}ShowerProfile_{information_type}"] = (
+    put_frame_key(frame, f"{leading_type}ShowerProfile_{information_type}", (
         dataclasses.I3MapStringDouble(dict_training)
-    )
+    ))
 
 
 def make_shower_and_stochasticity_info(
@@ -402,9 +403,9 @@ def make_shower_and_stochasticity_info(
             "leading_length_deposited": -1,
         }
 
-        frame["ShowerLengthDeposited"] = dataclasses.I3MapStringDouble(
+        put_frame_key(frame, "ShowerLengthDeposited", dataclasses.I3MapStringDouble(
             length_deposited
-        )
+        ))
 
         return
 
@@ -445,9 +446,9 @@ def make_shower_and_stochasticity_info(
         "leading_length_deposited": s_max_leading - s_min_leading,
     }
 
-    frame["ShowerLengthDeposited"] = dataclasses.I3MapStringDouble(
+    put_frame_key(frame, "ShowerLengthDeposited", dataclasses.I3MapStringDouble(
         length_deposited
-    )
+    ))
 
     compute_training_labels(
         frame,
@@ -517,7 +518,7 @@ def rms_closest_approach(
     ca_muon_info = pl.DataFrame(oms)
     
     if len(ca_muon_info) == 0:
-        frame[key] = dataclasses.I3Double(-1)
+        put_frame_key(frame, key, dataclasses.I3Double(-1))
         return
 
     r, cx, cy, cz, s = closest_approach_distance_vector(
@@ -531,7 +532,7 @@ def rms_closest_approach(
     w = ca_muon_info['energy'].to_numpy()
     rms = np.sqrt(np.sum(w * r**2) / np.sum(w))
     
-    frame[key] = dataclasses.I3Double(rms)
+    put_frame_key(frame, key, dataclasses.I3Double(rms))
 
 def compute_rms_surface(
     frame,
@@ -556,7 +557,7 @@ def compute_rms_surface(
     surface_muon_info = pl.DataFrame(oms)
     
     if len(surface_muon_info) == 0:
-        frame[key] = dataclasses.I3Double(-1)
+        put_frame_key(frame, key, dataclasses.I3Double(-1))
         return
 
     zd = surface_muon_info['z'].to_numpy() - leading.pos.z
@@ -566,4 +567,4 @@ def compute_rms_surface(
     w = surface_muon_info['energy'].to_numpy()
     rms = np.sqrt(np.sum(w * r**2) / np.sum(w))
 
-    frame[key] = dataclasses.I3Double(rms)
+    put_frame_key(frame, key, dataclasses.I3Double(rms))

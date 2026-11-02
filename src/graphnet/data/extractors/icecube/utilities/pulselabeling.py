@@ -155,7 +155,7 @@ def make_labeled_pulses(
     photon_ids, muon_ids = get_muon_ids(frame)
     oms = defaultdict(list)
 
-    for _, dom in enumerate(doms_hit_by_different_particles):
+    for dom in doms_hit_by_different_particles.items():
 
         dom_specific_pulses = np.asarray(dom_pulses[dom[0]])
 
@@ -255,7 +255,7 @@ def compute_residual_information(
 
     oms = defaultdict(list)
 
-    for _, dom in enumerate(doms_hit_by_different_particles):
+    for dom in doms_hit_by_different_particles.items():
 
         dom_specific_pulses = np.asarray(dom_pulses[dom[0]])
         # print(_, len(doms_hit_by_different_particles))
