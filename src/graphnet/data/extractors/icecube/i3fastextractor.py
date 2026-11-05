@@ -22,6 +22,10 @@ class I3FastExtractor(I3Extractor):
         training_data: bool = False,
         #exclude_saturation: bool = False,
         #exclude_calibration_errata: bool = False,
+        charge_windows: tuple = (5, 10, 25, 50, 100, 250, 500, 1000),
+        percentiles: np.ndarray = np.asarray([1, 10, 25, 50, 75, 90, 95]),
+        saturation_exclusions: bool = False,
+        errata_exclusions: bool = False,
         percentile_time_cap: float = 1000.0,
     ) -> None:
         """Construct I3FastExtractor.
@@ -44,9 +48,10 @@ class I3FastExtractor(I3Extractor):
         self._percentile_time_cap = percentile_time_cap
 
         # Must match the `charge_after_<w>` / `time_after_<p>` output keys
-        self._charge_windows = (5, 10, 25, 50, 100, 250, 500, 1000)
-        self._percentiles = np.asarray([1, 10, 25, 50, 75, 90, 95])
-
+        self._charge_windows = charge_windows
+        self._percentiles = percentiles
+        self._saturation_exclusions = saturation_exclusions
+        self._errata_exclusions = errata_exclusions
         # Base class constructor
         super().__init__(pulsemap, exclude=exclude)
 
@@ -84,60 +89,27 @@ class I3FastExtractorIceCube86(I3FastExtractor):
             #"pmt_number": [],
             "dom_number": [],
             #"dom_type": [],
-            "charge_after_5": [],
-            "charge_after_5_sat": [],
-            "charge_after_5_sat_no_errata": [],
-            "charge_after_10": [],
-            "charge_after_10_sat": [],
-            "charge_after_10_sat_no_errata": [],
-            "charge_after_25": [],
-            "charge_after_25_sat": [],
-            "charge_after_25_sat_no_errata": [],
-            "charge_after_50": [],
-            "charge_after_50_sat": [],
-            "charge_after_50_sat_no_errata": [],
-            "charge_after_100": [],
-            "charge_after_100_sat": [],
-            "charge_after_100_sat_no_errata": [],
-            "charge_after_250": [],
-            "charge_after_250_sat": [],
-            "charge_after_250_sat_no_errata": [],
-            "charge_after_500": [],
-            "charge_after_500_sat": [],
-            "charge_after_500_sat_no_errata": [],
-            "charge_after_1000": [],
-            "charge_after_1000_sat": [],
-            "charge_after_1000_sat_no_errata": [],
             "dom_qtot": [],
             "dom_qtot_no_sat": [],
             "dom_qtot_no_sat_no_errata": [],
-
-            # Max 1000 after 1st Pulse
-            "time_after_1": [],
-            "time_after_1_sat": [],
-            "time_after_1_sat_no_errata": [],
-            "time_after_10": [],
-            "time_after_10_sat": [],
-            "time_after_10_sat_no_errata": [],
-            "time_after_25": [],
-            "time_after_25_sat": [],
-            "time_after_25_sat_no_errata": [],
-            "time_after_50": [],
-            "time_after_50_sat": [],
-            "time_after_50_sat_no_errata": [],
-            "time_after_75": [],
-            "time_after_75_sat": [],
-            "time_after_75_sat_no_errata": [],
-            "time_after_90": [],
-            "time_after_90_sat": [],
-            "time_after_90_sat_no_errata": [],
-            "time_after_95": [],
-            "time_after_95_sat": [],
-            "time_after_95_sat_no_errata": [],
         }
+
+        output.update({f'charge_after_{w}': [] for w in self._charge_windows})
+        output.update({f'time_after_{p}': [] for p in self._percentiles})
+        
+        
+        if self._saturation_exclusions:
+            output.update({f'charge_after_{w}_sat': [] for w in self._charge_windows})
+            output.update({f'time_after_{p}_sat': [] for p in self._percentiles})
+
+        if self._errata_exclusions:
+            output.update({f'charge_after_{w}_sat_no_errata': [] for w in self._charge_windows})
+            output.update({f'time_after_{p}_sat_no_errata': [] for p in self._percentiles})
+
         if self._training_data:
             output["dom_r"] = []
             output["dom_time_residual"] = []
+
 
         # Get OM data
         if self._pulsemap in frame:
@@ -276,17 +248,23 @@ class I3FastExtractorIceCube86(I3FastExtractor):
             last = np.searchsorted(dt, self._charge_windows, side="right") - 1  # dt[0] == 0
             for w, i in zip(self._charge_windows, last):
                 output[f"charge_after_{w}"].append(float(cq[i]))
-                output[f"charge_after_{w}_sat"].append(float(cq_no_sat[i]))
-                output[f"charge_after_{w}_sat_no_errata"].append(float(cq_no_sat_no_errata[i]))
+                if self._saturation_exclusions:
+                    output[f"charge_after_{w}_sat"].append(float(cq_no_sat[i]))
+                if self._errata_exclusions:
+                    output[f"charge_after_{w}_sat_no_errata"].append(float(cq_no_sat_no_errata[i]))
 
             # time_after_<p>: time since first pulse at which p% of the charge
             # within `percentile_time_cap` has been collected
             n_cap = np.searchsorted(dt, self._percentile_time_cap, side="right")
-            for suffix, cq_x in (
-                ("", cq),
-                ("_sat", cq_no_sat),
-                ("_sat_no_errata", cq_no_sat_no_errata),
-            ):
+
+            # Only if saturation / errata exclusions are enabled, compute the percentiles for each case
+            cq_variants = [("", cq)]
+            if self._saturation_exclusions:
+                cq_variants.append(("_sat", cq_no_sat))
+            if self._errata_exclusions:
+                cq_variants.append(("_sat_no_errata", cq_no_sat_no_errata))
+
+            for suffix, cq_x in cq_variants:
                 t_pct = self._percentile_times(dt[:n_cap], cq_x[:n_cap], padding_value)
                 for p, t in zip(self._percentiles, t_pct):
                     output[f"time_after_{p}{suffix}"].append(float(t))

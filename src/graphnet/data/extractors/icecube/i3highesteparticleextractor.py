@@ -1,6 +1,6 @@
 """Extract the highest energy particle in the event."""
 
-from typing import Dict, Any, TYPE_CHECKING, Tuple, Union, List
+from typing import Dict, Any, TYPE_CHECKING, Tuple, Union, List, Optional
 
 
 from .i3extractor import I3Extractor
@@ -29,6 +29,7 @@ class I3HighestEparticleExtractor(I3Extractor):
     def __init__(
         self,
         hull: GCD_hull,
+        numu_starting_hull: Optional[GCD_hull] = None,
         mctree: str = "I3MCTree",
         mmctracklist: str = "MMCTrackList",
         extractor_name: str = "HighestEInVolumeParticle",
@@ -40,6 +41,9 @@ class I3HighestEparticleExtractor(I3Extractor):
 
         Args:
             hull: GCD_hull object
+            numu_starting_hull: GCD_hull object used to decide whether CC
+                                events (InteractionType 1) are starting.
+                                If None, `hull` is used.
             mctree: Name of the MCTree object.
             mmctracklist: Name of the MMCTrackList object.
             extractor_name: Name of the extractor.
@@ -51,6 +55,7 @@ class I3HighestEparticleExtractor(I3Extractor):
         """
         # Member variable(s)
         self.hull = hull
+        self.numu_starting_hull = numu_starting_hull
         self.mctree = mctree
         self.mmctracklist = mmctracklist
         self.daughters = daughters
@@ -466,7 +471,21 @@ class I3HighestEparticleExtractor(I3Extractor):
                         containment = track_containment(
                             intersections.first, intersections.second, length
                         )
-                        if containment in [
+                        # The energy, visible length and containment above
+                        # use the padded hull. Whether pos is the start of
+                        # the track or its closest approach to the detector
+                        # centre uses the hull of _starting_hull.
+                        pos_intersections = self._starting_hull(
+                            frame
+                        ).surface.intersection(
+                            track_particle.pos, track_particle.dir
+                        )
+                        pos_containment = track_containment(
+                            pos_intersections.first,
+                            pos_intersections.second,
+                            length,
+                        )
+                        if pos_containment in [
                             GN_containment_types.contained.value,
                             GN_containment_types.starting.value,
                         ]:
@@ -507,6 +526,30 @@ class I3HighestEparticleExtractor(I3Extractor):
             visible_length_adjusted,
         )
 
+    def _starting_hull(self, frame: "icetray.I3Frame") -> GCD_hull:
+        """Return the hull used to decide whether an event is starting.
+
+        NuMu CC events (|PDG| 14 and InteractionType 1) use
+        `numu_starting_hull` if given, all other events use the hull given to
+        the extractor.
+
+        Args:
+            frame: I3Frame object
+        """
+        weight_dict = (
+            frame["I3MCWeightDict"] if "I3MCWeightDict" in frame else None
+        )
+        if (
+            self.numu_starting_hull is not None
+            and weight_dict is not None
+            and "InteractionType" in weight_dict
+            and int(weight_dict["InteractionType"]) == 1
+            and "PolyplopiaPrimary" in frame
+            and abs(frame["PolyplopiaPrimary"].pdg_encoding) == 14
+        ):
+            return self.numu_starting_hull
+        return self.hull
+
     def highest_energy_starting(  # noqa: C901
         self,
         frame: "icetray.I3Frame",
@@ -527,6 +570,7 @@ class I3HighestEparticleExtractor(I3Extractor):
         frame: I3Frame object
         min_e: minimum energy for a particle to be considered
         """
+        hull = self._starting_hull(frame)
         EonEntrance = 0.0
         dummy_particle = dataclasses.I3Particle()
         dummy_particle.energy = 0.0
@@ -578,7 +622,7 @@ class I3HighestEparticleExtractor(I3Extractor):
         pos, direc, lengths = self.get_pos_dir_length(particles)
         pos = pos + direc * lengths
         pos = np.stack(pos)
-        in_volume = self.hull.point_in_hull(pos)
+        in_volume = hull.point_in_hull(pos)
         particles = particles[in_volume]
         energies = energies[in_volume]
         pos = pos[in_volume]
@@ -618,7 +662,7 @@ class I3HighestEparticleExtractor(I3Extractor):
         # be reconstructable and therefore added to the energy on entrance
         E_tracks = 0
         if len(tracks) > 0:
-            tracks_in_volume = self.hull.point_in_hull(
+            tracks_in_volume = hull.point_in_hull(
                 np.array([p.pos for p in tracks])
             )
             tracks = tracks[tracks_in_volume]
@@ -628,7 +672,7 @@ class I3HighestEparticleExtractor(I3Extractor):
             t_containments = []
             real_track = False
             for track in tracks:
-                intersections = self.hull.surface.intersection(
+                intersections = hull.surface.intersection(
                     track.pos, track.dir
                 )
 
@@ -666,7 +710,7 @@ class I3HighestEparticleExtractor(I3Extractor):
         # if the cascade starts inside the detector
         E_cascades = 0
         if len(cascades) > 0:
-            cascades_in_volume = self.hull.point_in_hull(
+            cascades_in_volume = hull.point_in_hull(
                 np.array([p.pos for p in cascades])
             )
             cascades = cascades[cascades_in_volume]
@@ -685,7 +729,7 @@ class I3HighestEparticleExtractor(I3Extractor):
                 visible_length_adjusted = max(
                     visible_length_adjusted, cascade_extent
                 )
-                terminal_in_hull = self.hull.point_in_hull(
+                terminal_in_hull = hull.point_in_hull(
                     cascade_terminal_pos
                 )
                 if terminal_in_hull:
