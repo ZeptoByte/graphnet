@@ -71,6 +71,7 @@ class NeutrinoEventMultitaskTransformer(GNN):
         qk_norm: bool = False,
         pair_features: Optional[Sequence[str]] = None,
         isolate_task_tokens: bool = False,
+        final_norm: bool = False,
     ):
         """Construct `NeutrinoEventMultitaskTransformer`.
 
@@ -142,6 +143,11 @@ class NeutrinoEventMultitaskTransformer(GNN):
                 queries (see the class docstring): no node, shared token or
                 other task attends to a task's tokens in the self-attention
                 blocks, and the token-only blocks hold the task tokens only.
+            final_norm: If True, each task token of the final block is
+                layer-normalized (one `LayerNorm` shared by all tokens) before
+                the optional `out_dim` projection, as in pre-norm
+                transformers. Without `out_dim` the tasks then read
+                normalized tokens directly.
         """
         cross_attention = list(cross_attention or [])
         tot_out = (out_dim if out_dim is not None else hidden_dim) * n_tasks
@@ -270,6 +276,9 @@ class NeutrinoEventMultitaskTransformer(GNN):
                 apply_sin_emb=embed_bias,
             )
 
+        self.final_norm: Optional[nn.Module] = (
+            nn.LayerNorm(hidden_dim) if final_norm else None
+        )
         self.task_out: Optional[nn.Module] = None
         if out_dim is not None:
             self.task_out = nn.Sequential(
@@ -369,6 +378,8 @@ class NeutrinoEventMultitaskTransformer(GNN):
 
         # Task tokens of the final block (shared tokens are dropped).
         x = x[:, n_shared:n_tokens]
+        if self.final_norm is not None:
+            x = self.final_norm(x)
         if self.token_multiplier > 1:
             x = x.reshape(
                 batch_size, self.n_tasks, self.token_multiplier * x.shape[-1]
