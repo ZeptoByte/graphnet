@@ -190,7 +190,7 @@ class RecomputeChargeFilter(I3Filter):
     """Passes if charge meets charge_cut threshold."""
 
     def __init__(
-        self, min_charge: float = 1e4, pulsemap: str = "SplitInIcePulses"
+        self, min_charge: float = 1e4, pulsemap: str = "SplitInIcePulses", has_mctree: bool = False,
     ):
         """Initialize RecomputeChargeFilter.
 
@@ -205,6 +205,7 @@ class RecomputeChargeFilter(I3Filter):
         gcd_file = "/cvmfs/icecube.opensciencegrid.org/data/GCD/GeoCalibDetectorStatus_2020.Run134142.Pass2_V0.i3.gz"
         f = dataio.I3File(gcd_file)
         self._cal = f.pop_frame(icetray.I3Frame.Calibration)["I3Calibration"]
+        self._has_mctree = has_mctree
 
     def _keep_frame(self, frame: "icetray.I3Frame") -> bool:
         """Check if current frame should be kept.
@@ -220,12 +221,13 @@ class RecomputeChargeFilter(I3Filter):
             # no splitinicepulses
             return False
 
-        try:
-            mctree = frame["I3MCTree"]
-        except:
-            # mctree issue
-            print("mctree issue")
-            return False
+        if self._has_mctree == True:
+            try:
+                mctree = frame["I3MCTree"]
+            except:
+                # mctree issue
+                print("mctree issue")
+                return False
 
         om_keys = data.keys()
 
@@ -265,6 +267,12 @@ class RecomputeChargeFilter(I3Filter):
         ].sum()
 
         q_total_bubble_cut = q_total[q_total["charge"] < total_charge / 2]
+
+        if 'Total_Charge' in frame:
+            del frame["Total_Charge"]
+            frame['Total_Charge'] = dataclasses.I3Double(total_charge)
+        else:
+            frame['Total_Charge'] = dataclasses.I3Double(total_charge)
 
         try:
             frame["HQTOT"] = dataclasses.I3Double(

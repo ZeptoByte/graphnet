@@ -41,6 +41,7 @@ class I3BundleExtractor(I3Extractor):
         borders: Optional[List[np.ndarray]] = None,
         mctree: Optional[str] = "I3MCTree_preMuonProp",
         pulse_labeling: Optional[bool] = False,
+        has_mctree: Optional[bool] = False,
     ):
         """Construct I3BundleExtractor.
 
@@ -94,6 +95,8 @@ class I3BundleExtractor(I3Extractor):
         else:
             self._borders = borders
         self._mctree = mctree
+        self._has_mctree = has_mctree
+
         self._dom_list = compute_dom_positions()
         self._outer_boundar = make_outer_boundary(self._dom_list)
 
@@ -126,6 +129,8 @@ class I3BundleExtractor(I3Extractor):
             "closest_approach_x": padding_value,  # Closest Approach X Coordinate
             "closest_approach_y": padding_value,  # Closest Approach Y Coordinate
             "closest_approach_z": padding_value,  # Closest Approach Z Coordinate
+            "leading_energy": padding_value,
+            "closest_approach_time": padding_value,
             "topology_primary_high": padding_value,
             "topology_primary_low": padding_value,
             "topology_leading_high": padding_value,
@@ -206,7 +211,7 @@ class I3BundleExtractor(I3Extractor):
             frame,
         )
 
-        primary, leading = self._get_leading_particle(
+        primary, leading, energy, ca_time = self._get_leading_particle(
             frame,
         )
 
@@ -217,6 +222,8 @@ class I3BundleExtractor(I3Extractor):
                 "zenith": primary.dir.zenith,
                 "leading_azimuth": leading.dir.azimuth,  # Highest energy in-ice muon (CORSIKA) / end of neutrino first-child chain (NuGen)
                 "leading_zenith": leading.dir.zenith,
+                "closest_approach_time": ca_time,
+                "leading_energy": energy,
                 "pid": primary_particle.pdg_encoding,
                 "interaction_type": interaction_type,
             }
@@ -246,39 +253,49 @@ class I3BundleExtractor(I3Extractor):
 
         self._get_lateral_and_stochasticity_info(
             frame,
+            self._has_mctree,
         )
 
-        output.update(
-            {
-                "rms_closest_approach": frame["rms_closest_approach"].value,
-                "rms_surface": frame["rms_surface"].value,
-                #"primary_rms_energy": frame['PrimaryShowerProfile_energy']['lateral_rms'],
-                #"primary_rms3_energy": frame['PrimaryShowerProfile_energy']['lateral_rms3'],
-                #"primary_rms_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms'],
-                #"primary_rms3_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms3'],
-                #'primary_most_lateral_deposit': frame['PrimaryShowerProfile_MCPEs']['most_lateral_deposit'],
-                "leading_rms_energy": frame['LeadingShowerProfile_energy']['lateral_rms'],
-                "leading_rms3_energy": frame['LeadingShowerProfile_energy']['lateral_rms3'],
-                "leading_rms_MCPE": frame['LeadingShowerProfile_MCPEs']['lateral_rms'],
-                "leading_rms3_MCPE": frame['LeadingShowerProfile_MCPEs']['lateral_rms3'],
-                'leading_most_lateral_deposit': frame['LeadingShowerProfile_MCPEs']['most_lateral_deposit'],
-                #"primary_stochasticity_std_energy": frame['PrimaryShowerProfile_energy']['stochasticity_std'],
-                #"primary_stochasticity_pomean_energy": frame['PrimaryShowerProfile_energy']['stochasticity_ratio_above_mean'],
-                #"primary_stochasticity_pomedian_energy": frame['PrimaryShowerProfile_energy']['stochasticity_ratio_above_median'],
-                #"primary_stochasticity_std_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_std'],
-                #"primary_stochasticity_pomean_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_ratio_above_mean'],
-                #"primary_stochasticity_pomedian_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_ratio_above_median'],
-                "leading_stochasticity_std_energy": frame['LeadingShowerProfile_energy']['stochasticity_std'],
-                "leading_stochasticity_pomean_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_mean'],
-                "leading_stochasticity_pomedian_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_median'],
-                "leading_stochasticity_std_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_std'],
-                "leading_stochasticity_pomean_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_mean'],
-                "leading_stochasticity_pomedian_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_median'],
-                #"primary_length_deposited": frame['ShowerLengthDeposited']['primary_length_deposited'],
-                "leading_length_deposited": frame['ShowerLengthDeposited']['leading_length_deposited'],
-                "fraction_coincidence": frame['fraction_coincidence'].value,
-            }
-        )
+        if self._has_mctree:
+            output.update(
+                {
+                    "rms_closest_approach": frame["rms_closest_approach"].value,
+                    "rms_surface": frame["rms_surface"].value,
+                    #"primary_rms_energy": frame['PrimaryShowerProfile_energy']['lateral_rms'],
+                    #"primary_rms3_energy": frame['PrimaryShowerProfile_energy']['lateral_rms3'],
+                    #"primary_rms_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms'],
+                    #"primary_rms3_MCPE": frame['PrimaryShowerProfile_MCPEs']['lateral_rms3'],
+                    #'primary_most_lateral_deposit': frame['PrimaryShowerProfile_MCPEs']['most_lateral_deposit'],
+                    "leading_rms_energy": frame['LeadingShowerProfile_energy']['lateral_rms'],
+                    "leading_rms3_energy": frame['LeadingShowerProfile_energy']['lateral_rms3'],
+                    "leading_rms_MCPE": frame['LeadingShowerProfile_MCPEs']['lateral_rms'],
+                    "leading_rms3_MCPE": frame['LeadingShowerProfile_MCPEs']['lateral_rms3'],
+                    'leading_most_lateral_deposit': frame['LeadingShowerProfile_MCPEs']['most_lateral_deposit'],
+                    #"primary_stochasticity_std_energy": frame['PrimaryShowerProfile_energy']['stochasticity_std'],
+                    #"primary_stochasticity_pomean_energy": frame['PrimaryShowerProfile_energy']['stochasticity_ratio_above_mean'],
+                    #"primary_stochasticity_pomedian_energy": frame['PrimaryShowerProfile_energy']['stochasticity_ratio_above_median'],
+                    #"primary_stochasticity_std_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_std'],
+                    #"primary_stochasticity_pomean_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_ratio_above_mean'],
+                    #"primary_stochasticity_pomedian_MCPE": frame['PrimaryShowerProfile_MCPEs']['stochasticity_ratio_above_median'],
+                    "leading_stochasticity_std_energy": frame['LeadingShowerProfile_energy']['stochasticity_std'],
+                    "leading_stochasticity_pomean_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_mean'],
+                    "leading_stochasticity_pomedian_energy": frame['LeadingShowerProfile_energy']['stochasticity_ratio_above_median'],
+                    "leading_stochasticity_std_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_std'],
+                    "leading_stochasticity_pomean_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_mean'],
+                    "leading_stochasticity_pomedian_MCPE": frame['LeadingShowerProfile_MCPEs']['stochasticity_ratio_above_median'],
+                    #"primary_length_deposited": frame['ShowerLengthDeposited']['primary_length_deposited'],
+                    "leading_length_deposited": frame['ShowerLengthDeposited']['leading_length_deposited'],
+                    "fraction_coincidence": frame['fraction_coincidence'].value,
+                }
+            )
+        else:
+            # Only Add Keys That Don't Depend on MCTree
+            output.update(
+                {
+                    "rms_closest_approach": frame["rms_closest_approach"].value,
+                    "rms_surface": frame["rms_surface"].value,
+                }
+            )
 
         return output
 
@@ -288,7 +305,6 @@ class I3BundleExtractor(I3Extractor):
     ):
         primary = frame["PolyplopiaPrimary"]
         pdg = frame["PolyplopiaPrimary"].pdg_encoding
-        full_mctree = frame["I3MCTree"]
         mctree = frame["I3MCTree_preMuonProp"]
         if np.abs(pdg) in [12, 14, 16]:
             current = mctree[1]
@@ -302,6 +318,9 @@ class I3BundleExtractor(I3Extractor):
                 primary.pos.x = current.pos.x
                 primary.pos.y = current.pos.y
                 primary.pos.z = current.pos.z
+
+            total_energy = primary.energy
+            closest_approach_time = current.time
         else:
             current = mctree[frame["PolyplopiaPrimary"]]
             highest_energy = -1
@@ -314,8 +333,21 @@ class I3BundleExtractor(I3Extractor):
                     if particle.energy > highest_energy:
                         highest_energy = particle.energy
                         current = particle
-        
-        return primary, current
+
+            tracklist = frame["MMCTrackList"]
+
+            e_initial = 0
+            closest_approach_time = 0
+            total_energy = 0
+            for track in tracklist:
+                if mctree.is_in_subtree(primary, track.particle) == True: # Cleaning Coincidence Hits
+                    if track.Ei > e_initial:
+                        e_initial = track.Ei
+                        closest_approach_time = track.tc
+                        current = track.particle
+                    total_energy += track.Ei
+
+        return primary, current, total_energy, closest_approach_time
 
     def _get_basic_event_information(
         self,
@@ -473,9 +505,11 @@ class I3BundleExtractor(I3Extractor):
     def _get_lateral_and_stochasticity_info(
         self,
         frame,
+        has_mctree: bool = False,
     ):
 
-        make_shower_and_stochasticity_info(frame)
+        if has_mctree:
+            make_shower_and_stochasticity_info(frame)
         rms_closest_approach(frame)
         compute_rms_surface(frame)
 

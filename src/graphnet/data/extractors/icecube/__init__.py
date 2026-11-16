@@ -16,8 +16,6 @@ from .i3highesteparticleextractor import (
 from .i3fastextractor import (
     I3FastExtractor,
     I3FastExtractorIceCube86,
-    I3FastExtractorIceCubeDeepCore,
-    I3FastExtractorIceCubeUpgrade,
 )
 
 from .i3featureextractorlegacy import (

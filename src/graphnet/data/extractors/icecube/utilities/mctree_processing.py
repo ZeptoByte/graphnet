@@ -23,7 +23,7 @@ from graphnet.data.extractors.icecube.utilities.vector_computations import (
 from graphnet.data.extractors.icecube.utilities.frames import put_frame_key
 
 
-def get_leading_particle(
+def get_leading_particle_old(
     frame,
 ):
 
@@ -57,6 +57,48 @@ def get_leading_particle(
 
     return primary, current
 
+def get_leading_particle(
+    frame,
+):
+
+    primary = frame["PolyplopiaPrimary"]
+    pdg = frame["PolyplopiaPrimary"].pdg_encoding
+    mctree = frame["I3MCTree_preMuonProp"]
+    if np.abs(pdg) in [12, 14, 16]:
+        current = mctree[1]
+        while mctree.number_of_children(current) > 0:
+            current = mctree.first_child(current)
+        if np.abs(pdg) in [12, 14, 16]:
+            current = mctree[1]
+            while mctree.number_of_children(current) > 0:
+                current = mctree.first_child(current)
+
+            primary.pos.x = current.pos.x
+            primary.pos.y = current.pos.y
+            primary.pos.z = current.pos.z
+    else:
+        current = mctree[frame["PolyplopiaPrimary"]]
+        highest_energy = -1
+        bundle_particles = mctree.get_daughters(current)
+        for particle in bundle_particles:
+            if (
+                particle.type_string in ["MuPlus", "MuMinus"]
+                and particle.location_type_string == "InIce"
+            ):
+                if particle.energy > highest_energy:
+                    highest_energy = particle.energy
+                    current = particle
+
+        tracklist = frame["MMCTrackList"]
+
+        e_initial = 0
+        for track in tracklist:
+            if mctree.is_in_subtree(primary, track.particle) == True: # Cleaning Coincidence Hits
+                if track.Ei > e_initial:
+                    e_initial = track.Ei
+                    current = track.particle
+                
+    return primary, current
 
 def turn_mctree_into_light_sources(
     frame,

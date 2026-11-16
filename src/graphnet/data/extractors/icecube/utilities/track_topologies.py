@@ -307,6 +307,15 @@ def get_leading_particle(
                     highest_energy = particle.energy
                     current = particle
 
+        tracklist = frame["MMCTrackList"]
+        
+        e_initial = 0
+        for track in tracklist:
+            if mctree.is_in_subtree(primary, track.particle) == True: # Cleaning Coincidence Hits
+                if track.Ei > e_initial:
+                    e_initial = track.Ei
+                    current = track.particle
+
     return primary, current
 
 
