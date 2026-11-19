@@ -4,7 +4,7 @@ A transformer backbone producing one output token group per task, for
 reconstructing several quantities of an event with a single model.
 """
 
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -78,7 +78,7 @@ class NeutrinoEventMultitaskTransformer(GNN):
         isolate_task_tokens: bool = False,
         final_norm: bool = False,
         mlp_type: str = "gelu",
-        activation_checkpointing: bool = False,
+        activation_checkpointing: Union[bool, int] = False,
         channel_gates: bool = False,
         gate_init: Optional[float] = None,
     ):
@@ -168,7 +168,9 @@ class NeutrinoEventMultitaskTransformer(GNN):
                 training; they are recomputed instead (`torch.utils.
                 checkpoint`, non-reentrant). Lower memory for roughly one
                 extra forward pass per step; no effect in evaluation and
-                no change of the parameters or outputs.
+                no change of the parameters or outputs. An integer `k`
+                checkpoints only the first `k` blocks (e.g. `n_rel`: the
+                relative-bias blocks, which hold the `[L, L]` pair terms).
             channel_gates: If True, the gated update of the tokens after
                 each token-only block (`cross_attention`) has one gate per
                 token and feature channel (`[1, n_tokens, hidden_dim]`,
@@ -215,7 +217,19 @@ class NeutrinoEventMultitaskTransformer(GNN):
             raise ValueError(
                 f"mlp_type must be one of {MLP_TYPES}, got {mlp_type}"
             )
-        self.activation_checkpointing = activation_checkpointing
+        if isinstance(activation_checkpointing, bool):
+            self._n_checkpointed = (
+                n_attention_blocks if activation_checkpointing else 0
+            )
+        else:
+            if not 0 <= int(activation_checkpointing) <= n_attention_blocks:
+                raise ValueError(
+                    "activation_checkpointing must be a bool or a number "
+                    f"of blocks in [0, {n_attention_blocks}], got "
+                    f"{activation_checkpointing}"
+                )
+            self._n_checkpointed = int(activation_checkpointing)
+        self.activation_checkpointing = self._n_checkpointed > 0
         self.ESA = nn.ModuleList(
             [
                 (
@@ -418,7 +432,7 @@ class NeutrinoEventMultitaskTransformer(GNN):
                 args = (x, token_mask, attn_mask)
             else:
                 args = (x, None, attn_mask)
-            if self.activation_checkpointing and self.training:
+            if i < self._n_checkpointed and self.training:
                 x = checkpoint(block, *args, use_reentrant=False)
             else:
                 x = block(*args)
