@@ -9,9 +9,14 @@ from typing import List, Optional, Sequence, Set, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 
-from graphnet.models.components.attention_blocks import Block, Block_rel
+from graphnet.models.components.attention_blocks import (
+    MLP_TYPES,
+    Block,
+    Block_rel,
+)
 from graphnet.models.components.embedding import (
     SinusoidalPosEmb,
     SpacetimeEncoder,
@@ -72,6 +77,10 @@ class NeutrinoEventMultitaskTransformer(GNN):
         pair_features: Optional[Sequence[str]] = None,
         isolate_task_tokens: bool = False,
         final_norm: bool = False,
+        mlp_type: str = "gelu",
+        activation_checkpointing: bool = False,
+        channel_gates: bool = False,
+        gate_init: Optional[float] = None,
     ):
         """Construct `NeutrinoEventMultitaskTransformer`.
 
@@ -148,6 +157,31 @@ class NeutrinoEventMultitaskTransformer(GNN):
                 the optional `out_dim` projection, as in pre-norm
                 transformers. Without `out_dim` the tasks then read
                 normalized tokens directly.
+            mlp_type: Feed-forward network of all attention blocks (self-
+                attention and token-only): "gelu" (default, two-layer GELU
+                MLP of width `mlp_ratio * hidden_dim`) or "swiglu" (gated
+                SiLU network of width `2/3 * mlp_ratio * hidden_dim`, about
+                the same parameters and FLOPs; Shazeer 2020). The
+                embedding MLP and `out_dim` projection are unchanged.
+            activation_checkpointing: If True, the self-attention blocks
+                do not keep their activations for the backward pass in
+                training; they are recomputed instead (`torch.utils.
+                checkpoint`, non-reentrant). Lower memory for roughly one
+                extra forward pass per step; no effect in evaluation and
+                no change of the parameters or outputs.
+            channel_gates: If True, the gated update of the tokens after
+                each token-only block (`cross_attention`) has one gate per
+                token and feature channel (`[1, n_tokens, hidden_dim]`,
+                like the per-channel scales of the cross-task attention of
+                Lopes et al. 2022) instead of one per token
+                (`[1, n_tokens, 1]`, default). Both start at sigmoid(0).
+            gate_init: Start value of the gate parameters before the
+                sigmoid, e.g. -3 (gate 0.047): the token-only blocks start
+                almost switched off, as the zero-initialised scales of the
+                cross-task attention of Lopes et al. 2022. If given, the
+                gates are also excluded from weight decay (which would pull
+                them back to 0, i.e. a gate of 0.5). None (default): 0,
+                weight-decayed as before.
         """
         cross_attention = list(cross_attention or [])
         tot_out = (out_dim if out_dim is not None else hidden_dim) * n_tasks
@@ -177,6 +211,11 @@ class NeutrinoEventMultitaskTransformer(GNN):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        if mlp_type not in MLP_TYPES:
+            raise ValueError(
+                f"mlp_type must be one of {MLP_TYPES}, got {mlp_type}"
+            )
+        self.activation_checkpointing = activation_checkpointing
         self.ESA = nn.ModuleList(
             [
                 (
@@ -185,6 +224,7 @@ class NeutrinoEventMultitaskTransformer(GNN):
                         num_heads,
                         mlp_ratio=mlp_ratio,
                         dropout=dropout,
+                        mlp_type=mlp_type,
                     )
                     if i < n_rel
                     else Block(
@@ -193,6 +233,7 @@ class NeutrinoEventMultitaskTransformer(GNN):
                         mlp_ratio=mlp_ratio,
                         dropout=dropout,
                         qk_norm=qk_norm,
+                        mlp_type=mlp_type,
                     )
                 )
                 for i in range(n_attention_blocks)
@@ -211,13 +252,21 @@ class NeutrinoEventMultitaskTransformer(GNN):
                     mlp_ratio=mlp_ratio,
                     drop_path=drop_path,
                     qk_norm=qk_norm,
+                    mlp_type=mlp_type,
                 )
                 for _ in cross_attention
             ]
         )
+        gate_width = hidden_dim if channel_gates else 1
+        self._decay_gates = gate_init is None
         self.gates = nn.ParameterList(
             [
-                nn.Parameter(torch.zeros(1, n_tokens, 1))
+                nn.Parameter(
+                    torch.full(
+                        (1, n_tokens, gate_width),
+                        0.0 if gate_init is None else float(gate_init),
+                    )
+                )
                 for _ in cross_attention
             ]
         )
@@ -299,12 +348,19 @@ class NeutrinoEventMultitaskTransformer(GNN):
 
     @torch.jit.ignore
     def no_weight_decay(self) -> Set:
-        """Exclude the learned tokens and temperatures from weight decay."""
-        return {"task_tokens", "shared_tokens"} | {
+        """Return the parameters to exclude from weight decay.
+
+        The learned tokens and attention temperatures, and the gates when
+        `gate_init` is given.
+        """
+        names = {"task_tokens", "shared_tokens"} | {
             name
             for name, _ in self.named_parameters()
             if name.endswith("attn.log_temperature")
         }
+        if not self._decay_gates:
+            names.add("gates")
+        return names
 
     def forward(self, data: Data) -> Tensor:
         """Apply learnable forward pass to input data."""
@@ -357,11 +413,15 @@ class NeutrinoEventMultitaskTransformer(GNN):
                 if self._basis_rel_bias:
                     proj = self.rel_proj[min(i, len(self.rel_proj) - 1)]
                     rel_pos_bias = self._basis_factors(basis, proj)
-                x = block(x, attn_mask, rel_pos_bias)
+                args = (x, attn_mask, rel_pos_bias)
             elif i >= self.inject_cls_after:
-                x = block(x, token_mask, attn_mask)
+                args = (x, token_mask, attn_mask)
             else:
-                x = block(x, None, attn_mask)
+                args = (x, None, attn_mask)
+            if self.activation_checkpointing and self.training:
+                x = checkpoint(block, *args, use_reentrant=False)
+            else:
+                x = block(*args)
 
             if i in self.cross_attention:
                 idx = self.cross_attention.index(i)

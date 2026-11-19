@@ -85,6 +85,82 @@ class Mlp(LightningModule):
         return x
 
 
+class SwiGLUMlp(LightningModule):
+    """Gated feed-forward network with a SiLU gate (SwiGLU).
+
+    `out(x) = W_out (silu(x W_gate) * (x W_value))`, as in Shazeer (2020),
+    "GLU Variants Improve Transformer". The gate and value projections are
+    one fused `nn.Linear` to `2 * hidden_features`.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        out_features: Optional[int] = None,
+        dropout_prob: float = 0.0,
+    ):
+        """Construct `SwiGLUMlp`.
+
+        Args:
+            in_features: Number of input features.
+            hidden_features: Width of the gated hidden layer (each of the
+                gate and value projections).
+            out_features: Number of output features. Defaults to
+                `in_features`.
+            dropout_prob: Dropout probability on the output.
+        """
+        super().__init__()
+        if in_features <= 0 or hidden_features <= 0:
+            raise ValueError(
+                f"in_features and hidden_features must be positive, got "
+                f"{in_features} and {hidden_features}"
+            )
+        out_features = out_features or in_features
+        self.input_projection = nn.Linear(in_features, 2 * hidden_features)
+        self.output_projection = nn.Linear(hidden_features, out_features)
+        self.dropout = nn.Dropout(dropout_prob)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward pass."""
+        gate, value = self.input_projection(x).chunk(2, dim=-1)
+        x = self.output_projection(nn.functional.silu(gate) * value)
+        return self.dropout(x)
+
+
+MLP_TYPES = ("gelu", "swiglu")
+
+
+def make_mlp(
+    input_dim: int,
+    mlp_ratio: float,
+    mlp_type: str,
+    activation: nn.Module,
+    dropout: float,
+) -> LightningModule:
+    """Feed-forward network of a transformer block.
+
+    `mlp_type` "gelu": `Mlp` with hidden width `mlp_ratio * input_dim`;
+    "swiglu": `SwiGLUMlp` with hidden width `2/3 * mlp_ratio * input_dim`
+    (rounded up to a multiple of 8), so that it has about the same number
+    of parameters and FLOPs as the "gelu" network (`activation` unused).
+    """
+    if mlp_type not in MLP_TYPES:
+        raise ValueError(
+            f"mlp_type must be one of {MLP_TYPES}, got {mlp_type}"
+        )
+    if mlp_type == "swiglu":
+        hidden = int(2 * input_dim * mlp_ratio / 3)
+        hidden = 8 * ((hidden + 7) // 8)
+        return SwiGLUMlp(input_dim, hidden, dropout_prob=dropout)
+    return Mlp(
+        in_features=input_dim,
+        hidden_features=int(input_dim * mlp_ratio),
+        activation=activation,
+        dropout_prob=dropout,
+    )
+
+
 class Attention_rel(LightningModule):
     """Attention mechanism with relative position bias."""
 
@@ -268,6 +344,7 @@ class Block_rel(LightningModule):
         activation: nn.Module = nn.GELU,
         norm_layer: nn.Module = nn.LayerNorm,
         attn_head_dim: Optional[int] = None,
+        mlp_type: str = "gelu",
     ):
         """Construct 'Block_rel'.
 
@@ -291,6 +368,9 @@ class Block_rel(LightningModule):
             norm_layer: Normalization layer to use.
             attn_head_dim: Dimension of the attention head outputs in the
                 `Attention_rel` layer.
+            mlp_type: Feed-forward network, "gelu" (`Mlp`, default) or
+                "swiglu" (`SwiGLUMlp` at about the same size, see
+                `make_mlp`).
         """
         super().__init__()
         self.norm1 = norm_layer(input_dim)
@@ -306,12 +386,8 @@ class Block_rel(LightningModule):
             DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
         self.norm2 = norm_layer(input_dim)
-        mlp_hidden_dim = int(input_dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=input_dim,
-            hidden_features=mlp_hidden_dim,
-            activation=activation,
-            dropout_prob=dropout,
+        self.mlp = make_mlp(
+            input_dim, mlp_ratio, mlp_type, activation, dropout
         )
 
         if init_values is not None:
@@ -534,6 +610,7 @@ class Block(LightningModule):
         activation: nn.Module = nn.GELU,
         norm_layer: nn.Module = nn.LayerNorm,
         qk_norm: bool = False,
+        mlp_type: str = "gelu",
     ):
         """Construct 'Block'.
 
@@ -556,6 +633,9 @@ class Block(LightningModule):
                 keys, learned temperature per head) instead of
                 `nn.MultiheadAttention`. Same parameter names, plus
                 `attn.log_temperature`.
+            mlp_type: Feed-forward network, "gelu" (`Mlp`, default) or
+                "swiglu" (`SwiGLUMlp` at about the same size, see
+                `make_mlp`).
         """
         super().__init__()
         self.norm1 = norm_layer(input_dim)
@@ -571,12 +651,8 @@ class Block(LightningModule):
             DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
         self.norm2 = norm_layer(input_dim)
-        mlp_hidden_dim = int(input_dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=input_dim,
-            hidden_features=mlp_hidden_dim,
-            activation=activation,
-            dropout_prob=dropout,
+        self.mlp = make_mlp(
+            input_dim, mlp_ratio, mlp_type, activation, dropout
         )
 
         if init_values is not None:
