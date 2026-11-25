@@ -287,7 +287,7 @@
     <li class="md-nav__item">
     
     
-      <a href="../installation/install.html" class="md-nav__link">Installation</a>
+      <a href="../installation/install.html" class="md-nav__link">Quick Start</a>
       
     
     </li>
@@ -364,6 +364,13 @@
     
       <a href="graphnet.models.html" class="md-nav__link">models</a>
       <ul class="md-nav__list"> 
+    <li class="md-nav__item">
+    
+    
+      <a href="graphnet.models.cnn.html" class="md-nav__link">cnn</a>
+      
+    
+    </li>
     <li class="md-nav__item">
     
     
@@ -545,6 +552,13 @@
     <li class="md-nav__item">
     
     
+      <a href="graphnet.models.data_representation.images.html" class="md-nav__link">images</a>
+      
+    
+    </li>
+    <li class="md-nav__item">
+    
+    
       <a href="graphnet.models.data_representation.data_representation.html" class="md-nav__link">data_representation</a>
       
     
@@ -618,6 +632,13 @@
     
     
       <a href="graphnet.models.normalizing_flow.html" class="md-nav__link">normalizing_flow</a>
+      
+    
+    </li>
+    <li class="md-nav__item">
+    
+    
+      <a href="graphnet.models.pretraining_maskpred.html" class="md-nav__link">pretraining_maskpred</a>
       
     
     </li>
@@ -747,16 +768,16 @@
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>x</strong> (<span class="sphinx_autodoc_typehints-type"><code class="xref py py-class docutils literal notranslate"><span class="pre">tensor</span></code></span>) – standardized node features with shape ´[num_pulses, d]´,</p></li>
+<li><p><strong>x</strong> (<span class="sphinx_autodoc_typehints-type"><code class="xref py py-class docutils literal notranslate"><span class="pre">Tensor</span></code></span>) – standardized node features with shape ´[num_pulses, d]´,</p></li>
 <li><p><strong>features.</strong> (<em>where ´d´ is the number</em><em> of </em><em>node</em>)</p></li>
 <li><p><strong>node_feature_names</strong> – list of names for each column in ´x´.</p></li>
 </ul>
 </dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>a graph without edges</p>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-class docutils literal notranslate"><span class="pre">Tensor</span></code></span></p>
 </dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>graph</p>
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Node feature tensor of shape ´[num_nodes, num_features]´.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -951,9 +972,14 @@ NOTE: Developed to be used with features</p>
 </dl>
 </li>
 </ul>
-<p>For more details on some of the features see
-Theo Glauchs thesis (chapter 5.3):
+<p>For more details on most of the listed features see
+Theo Glauch’s thesis (chapter 5.3):
 <a class="reference external" href="https://mediatum.ub.tum.de/node?id=1584755">https://mediatum.ub.tum.de/node?id=1584755</a></p>
+<dl class="simple">
+<dt>NOTE: The <cite>counts</cite> feature (number of pulses per cluster) is an</dt><dd><p>addition introduced in this implementation and is not part of
+the feature set described in the referenced thesis.</p>
+</dd>
+</dl>
 <p>Construct <cite>ClusterSummaryFeatures</cite>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>

@@ -15,7 +15,10 @@ transformer
 .. toctree::
    :maxdepth: 2
 
+   graphnet.models.transformer.deepice
+   graphnet.models.transformer.grit
    graphnet.models.transformer.iseecube
+   graphnet.models.transformer.neptune
 
 
 
