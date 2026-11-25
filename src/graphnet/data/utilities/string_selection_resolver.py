@@ -7,6 +7,7 @@ import os
 import re
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 
 from graphnet.utilities.logging import Logger
@@ -55,15 +56,25 @@ class StringSelectionResolver(Logger):
         use_cache: bool = True,
         use_super_selection: bool = False,
     ):
-        """Construct `StringSelectionResolver`."""
+        """Construct `StringSelectionResolver`.
+
+        Args:
+            dataset: Dataset the selection is resolved against.
+            index_column: Name of the event index column.
+            seed: Seed for random sub-sampling selections.
+            use_cache: Whether to cache resolved indices and values on disk.
+            use_super_selection: If True, the selection is passed to the
+                dataset's query (e.g. as an SQL `WHERE` clause) instead of
+                being evaluated with `pandas.DataFrame.query`. Caching is
+                then disabled.
+        """
         self._dataset = dataset
         self._index_column = index_column
         self._seed = seed
-        self._use_cache = use_cache
         self._use_super_selection = use_super_selection
+        self._use_cache = use_cache and not use_super_selection
+
         # Base class constructor
-        if self._use_super_selection:
-            self._use_cache = False
         super().__init__(name=__name__, class_name=self.__class__.__name__)
 
     # Public method(s)
@@ -131,7 +142,10 @@ class StringSelectionResolver(Logger):
 
             # Save names of functions
             elif isinstance(node, ast.Call):
-                functions.append(node.func.id)  # type: ignore[attr-defined]
+                if isinstance(node.func, ast.Attribute):
+                    functions.append(node.func.attr)
+                elif isinstance(node.func, ast.Name):
+                    functions.append(node.func.id)
 
         variables = list(set(names) - set(functions))
 
@@ -218,33 +232,25 @@ class StringSelectionResolver(Logger):
             df_values = self._load_values_cache(values_cache_path)
 
         else:
-            if self._use_super_selection:
-                df_values = pd.DataFrame(
-                    data=self._dataset.query_table(
-                        self._dataset.truth_table,
-                        list(variables),
-                        selection=selection,
-                    ).tolist(),
-                    columns=list(variables),
-                )
-
-            else:
-                df_values = pd.DataFrame(
-                    data=self._dataset.query_table(
-                        self._dataset.truth_table,
-                        list(variables),
-                    ).tolist(),
-                    columns=list(variables),
-                )
+            values = self._dataset.query_table(
+                self._dataset.truth_table,
+                list(variables),
+                selection=(selection if self._use_super_selection else None),
+            )
+            # A super selection that matches no event comes back as shape (0,)
+            df_values = pd.DataFrame(
+                data=np.asarray(values).reshape(-1, len(variables)),
+                columns=list(variables),
+            )
 
         # (Opt.) Cache indices.
         if self._use_cache and not os.path.exists(values_cache_path):
             self._save_values_cache(df_values, values_cache_path)
-        if not self._use_super_selection:
-            df_selection = df_values.query(selection)
-        else:
-            df_selection = df_values
-        return df_selection
+
+        if self._use_super_selection:
+            # Already applied by the dataset query.
+            return df_values
+        return df_values.query(selection)
 
     def _get_random_state(self, selection: str) -> Optional[int]:
         random_state: Optional[int] = None

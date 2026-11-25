@@ -1,12 +1,29 @@
 """Unit tests for LossFunction classes."""
 
 import numpy as np
+from typing import Any
+
 import pytest
 import torch
+import warnings
 from torch import Tensor
 from torch.autograd import grad
 
-from graphnet.training.loss_functions import LogCoshLoss, VonMisesFisherLoss
+from graphnet.training.loss_functions import (
+    BinaryCrossEntropyLoss,
+    CauchyLoss,
+    EnsembleLoss,
+    FocalBinaryCrossEntropyLoss,
+    LogCoshLoss,
+    LossFunction,
+    MAELoss,
+    MSELoss,
+    NegCosLoss,
+    RMSELoss,
+    spCauchyLoss,
+    VonMisesFisherLoss,
+    VonMisesFisher3DLoss,
+)
 from graphnet.utilities.maths import eps_like
 
 
@@ -70,7 +87,8 @@ def test_log_cosh(dtype: torch.dtype = torch.float32) -> None:
 def test_von_mises_fisher_exact_m3(dtype: torch.dtype = torch.float64) -> None:
     """Test implementaion of exact von-Mises Fisher loss with m=3.
 
-    See https://en.wikipedia.org/wiki/Von_Mises%E2%80%93Fisher_distribution
+    See
+    https://en.wikipedia.org/wiki/Von_Mises%E2%80%93Fisher_distribution
     for exact, simplified reference.
     """
     # Define test parameters
@@ -181,3 +199,1018 @@ def test_von_mises_fisher_approximation_large_kappa(
     assert torch.allclose(
         grads_approx[exact_is_valid], grads_exact[exact_is_valid], rtol=1e-2
     )
+
+
+def test_logcmk_backward_zero_handling(
+    dtype: torch.dtype = torch.float64,
+) -> None:
+    """Test LogCMK backward pass handles arrays with zero values correctly.
+
+    This test ensures that the LogCMK.backward method correctly handles cases
+    where the kappa tensor contains zero values without raising division by zero
+    errors or warnings. The implementation uses boolean masking to conditionally
+    apply different formulas for small (including zero) and large kappa values,
+    avoiding double evaluation that would cause RuntimeWarnings.
+
+    Args:
+        dtype: PyTorch data type for the test tensors.
+    """
+    # Test parameters
+    m = 3  # Dimension for which we have the exact formula
+
+    # Create kappa tensor with zeros and other values, including edge cases
+    kappa_values = [0.0, 1e-7, 1e-6, 1e-5, 0.1, 1.0, 10.0]
+    kappa = torch.tensor(kappa_values, dtype=dtype, requires_grad=True)
+
+    # Forward pass using VonMisesFisherLoss.log_cmk_exact which internally uses LogCMK
+    result = VonMisesFisherLoss.log_cmk_exact(m, kappa)
+
+    # Test that backward pass doesn't raise any errors or warnings
+    # Capture warnings to ensure no RuntimeWarnings are generated
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        try:
+            grads = torch.autograd.grad(
+                outputs=result.sum(),
+                inputs=kappa,
+                grad_outputs=None,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+            backward_success = True
+            error_msg = ""
+        except (ZeroDivisionError, RuntimeWarning) as e:
+            backward_success = False
+            error_msg = str(e)
+
+    # Verify no errors occurred
+    assert backward_success, f"Backward pass failed with error: {error_msg}"
+
+    # Verify no RuntimeWarnings were generated
+    runtime_warnings = [
+        w for w in caught_warnings if issubclass(w.category, RuntimeWarning)
+    ]
+    assert (
+        len(runtime_warnings) == 0
+    ), f"RuntimeWarnings were generated: {[str(w.message) for w in runtime_warnings]}"
+
+    # Verify gradients are finite
+    assert torch.all(
+        torch.isfinite(grads)
+    ), "Gradients should be finite for all kappa values"
+
+    # Test specific values for correctness
+    # For kappa=0, the gradient should be -kappa/3 = 0
+    zero_idx = 0  # Index where kappa=0
+    assert torch.isclose(
+        grads[zero_idx], torch.tensor(0.0, dtype=dtype)
+    ), f"Gradient at kappa=0 should be 0, got {grads[zero_idx]}"
+
+    # For very small kappa (1e-7), should use -kappa/3 approximation
+    small_kappa_idx = 1  # Index where kappa=1e-7
+    expected_small_grad = -kappa_values[small_kappa_idx] / 3
+    assert torch.isclose(
+        grads[small_kappa_idx],
+        torch.tensor(expected_small_grad, dtype=dtype),
+        atol=1e-10,
+    ), "Gradient for small kappa should use -kappa/3 approximation"
+
+    # Test with array containing multiple zeros
+    kappa_multi_zero = torch.tensor(
+        [0.0, 0.0, 1.0, 0.0, 10.0], dtype=dtype, requires_grad=True
+    )
+    result_multi = VonMisesFisherLoss.log_cmk_exact(m, kappa_multi_zero)
+
+    with warnings.catch_warnings(record=True) as caught_warnings_multi:
+        warnings.simplefilter("always")
+        try:
+            grads_multi = torch.autograd.grad(
+                outputs=result_multi.sum(),
+                inputs=kappa_multi_zero,
+                grad_outputs=None,
+            )[0]
+            multi_zero_success = True
+        except (ZeroDivisionError, RuntimeWarning):
+            multi_zero_success = False
+
+    assert multi_zero_success, "Should handle arrays with multiple zero values"
+    assert torch.all(
+        torch.isfinite(grads_multi)
+    ), "All gradients should be finite with multiple zeros"
+
+    # Verify no RuntimeWarnings for multiple zeros case
+    runtime_warnings_multi = [
+        w
+        for w in caught_warnings_multi
+        if issubclass(w.category, RuntimeWarning)
+    ]
+    assert (
+        len(runtime_warnings_multi) == 0
+    ), f"RuntimeWarnings were generated with multiple zeros: {[str(w.message) for w in runtime_warnings_multi]}"
+
+    # Verify that zero elements have zero gradients
+    zero_mask = kappa_multi_zero == 0.0
+    assert torch.all(
+        grads_multi[zero_mask] == 0.0
+    ), "Zero kappa values should have zero gradients"
+
+
+def test_vmf3d_log_cmk_closed_form(dtype: torch.dtype = torch.float64) -> None:
+    """Test the vMF-3D normalizer against the m=3 closed form.
+
+    `log C_3(k) = _log_cmk_scaled(k, eps) - k` is checked in value against
+    the reference log(k) - k - log(2 pi (1 - exp(-2k))) and in gradient
+    against d/dk log C_3(k) = 1/k - coth(k).
+    """
+    k = torch.tensor(
+        data=[0.1, 0.5, 1.0, 3.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0],
+        requires_grad=True,
+        dtype=dtype,
+    )
+
+    res = VonMisesFisher3DLoss._log_cmk_scaled(k, eps=1e-8) - k
+    res_reference = (
+        torch.log(k) - k - torch.log(2 * np.pi * (1 - torch.exp(-2 * k)))
+    )
+    assert torch.allclose(res, res_reference, atol=1e-6)
+
+    grads = _compute_elementwise_gradient(res, k)
+    grads_reference = 1 / k - 1 / torch.tanh(k)
+    assert torch.allclose(grads, grads_reference, atol=1e-6)
+
+
+def test_vmf3d_log_cmk_small_kappa(dtype: torch.dtype = torch.float64) -> None:
+    """Test the vMF-3D normalizer at and near kappa = 0.
+
+    The uniform-distribution limit is log(C_3(0)) = -log(4 pi); values
+    must hit it and both values and gradients must stay finite all the
+    way to 0.
+    """
+    k = torch.tensor(
+        data=[0.0, 1e-8, 1e-4, 1e-2],
+        requires_grad=True,
+        dtype=dtype,
+    )
+
+    res = VonMisesFisher3DLoss._log_cmk_scaled(k, eps=1e-8)
+    assert torch.all(torch.isfinite(res))
+    assert torch.isclose(
+        res[0], torch.tensor(-np.log(4 * np.pi), dtype=dtype), atol=1e-9
+    )
+    assert torch.allclose(
+        res, torch.full_like(res, -np.log(4 * np.pi)), atol=2e-2
+    )
+
+    grads = _compute_elementwise_gradient(res, k)
+    assert torch.all(torch.isfinite(grads))
+    # d/dk log(exp(k) C_3(k)) = 1 - A_3(k) -> 1 - k/3 for small k; only
+    # checked where the eps-regularization error eps/k**2 is subdominant.
+    assert torch.isclose(
+        grads[3], torch.tensor(1 - 1e-2 / 3, dtype=dtype), atol=1e-3
+    )
+
+
+def test_vmf3d_log_cmk_matches_bessel_path(
+    dtype: torch.dtype = torch.float64,
+) -> None:
+    """Test the closed-form normalizer against the Bessel-based path.
+
+    `_log_cmk_scaled(k, eps) - k` and `log_cmk_exact(3, k)` are independent
+    implementations of log C_3(k) (elementary closed form vs.
+    `scipy.special.iv`), so agreement validates both.
+    """
+    k = torch.tensor(
+        data=[0.1, 1.0, 10.0, 100.0, 500.0],
+        requires_grad=True,
+        dtype=dtype,
+    )
+
+    res = VonMisesFisher3DLoss._log_cmk_scaled(k, eps=1e-8) - k
+    res_bessel = VonMisesFisherLoss.log_cmk_exact(3, k)
+    assert torch.allclose(res, res_bessel, atol=1e-6)
+
+    grads = _compute_elementwise_gradient(res, k)
+    grads_bessel = _compute_elementwise_gradient(res_bessel, k)
+    assert torch.allclose(grads, grads_bessel, atol=1e-6)
+
+
+def test_vmf3d_loss_elements(dtype: torch.dtype = torch.float64) -> None:
+    """Test `VonMisesFisher3DLoss` elements against the plain NLL formula."""
+    torch.manual_seed(0)
+    n = 64
+    direction = torch.randn(n, 3, dtype=dtype)
+    direction = direction / direction.norm(dim=1, keepdim=True)
+    target = torch.randn(n, 3, dtype=dtype)
+    target = target / target.norm(dim=1, keepdim=True)
+    kappa = 10 ** (torch.rand(n, dtype=dtype) * 4 - 1)  # 0.1 ... 1000
+
+    prediction = torch.cat([direction, kappa.unsqueeze(1)], dim=1)
+    elements = VonMisesFisher3DLoss()._forward(prediction, target)
+
+    log_cmk_reference = (
+        torch.log(kappa)
+        - kappa
+        - torch.log(2 * np.pi * (1 - torch.exp(-2 * kappa)))
+    )
+    dotprod = (kappa.unsqueeze(1) * direction * target).sum(dim=1)
+    elements_reference = -log_cmk_reference - dotprod
+    assert torch.allclose(elements, elements_reference, atol=1e-6)
+
+
+def test_vmf3d_loss_no_gradient_dead_zone(
+    dtype: torch.dtype = torch.float64,
+) -> None:
+    """Test that the kappa-gradient has a stationary point for any alignment.
+
+    The optimum concentration satisfies A_3(kappa) = coth(kappa) - 1/kappa =
+    cos(theta). A derivative that is discontinuous somewhere in kappa leaves
+    a band of cos(theta) values with no stationary point, so gradient descent
+    pins kappa at the discontinuity for those events. The alignments below
+    place the optimum at kappa ~ 100...20000.
+    """
+    loss = VonMisesFisher3DLoss()
+    for cos_theta in [0.9905, 0.995, 0.999, 0.99995]:
+        sin_theta = float(np.sqrt(1 - cos_theta**2))
+        kappa = torch.logspace(1, 5, 500, dtype=dtype, requires_grad=True)
+        n = kappa.size(0)
+        direction = torch.tensor([[0.0, 0.0, 1.0]], dtype=dtype).repeat(n, 1)
+        target = torch.tensor(
+            [[sin_theta, 0.0, cos_theta]], dtype=dtype
+        ).repeat(n, 1)
+
+        prediction = torch.cat([direction, kappa.unsqueeze(1)], dim=1)
+        elements = loss._forward(prediction, target)
+        elements.sum().backward()
+        grads = kappa.grad
+
+        # A_3 is monotone, so d(loss)/d(kappa) = A_3(kappa) - cos(theta)
+        # must cross zero exactly once on a grid spanning the optimum.
+        signs = torch.sign(grads)
+        flips = (signs[1:] != signs[:-1]).nonzero().flatten()
+        assert len(flips) == 1, (cos_theta, len(flips))
+
+        kappa_star = kappa[flips[0]].detach()
+        a3 = 1 / torch.tanh(kappa_star) - 1 / kappa_star
+        assert torch.isclose(
+            a3, torch.tensor(cos_theta, dtype=dtype), atol=1e-3
+        )
+
+
+def test_vmf3d_loss_fp32_high_kappa_small_angle() -> None:
+    """Test float32 precision of the loss at high kappa and small angles.
+
+    The angular part of the loss is kappa * (1 - cos(theta)); computing it
+    via the squared chord ||t - mu||**2 keeps it accurate in float32 even
+    when 1 - cos(theta) is comparable to the float32 epsilon.
+    """
+    theta = 1e-3
+    kappa_value = 1e4
+    direction = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+    kappa = torch.tensor([[kappa_value]], dtype=torch.float32)
+    prediction = torch.cat([direction, kappa], dim=1)
+    target_aligned = direction.clone()
+    target_off = torch.tensor(
+        [[np.sin(theta), 0.0, np.cos(theta)]], dtype=torch.float32
+    )
+
+    loss = VonMisesFisher3DLoss()
+    angular_part = (
+        loss._forward(prediction, target_off)
+        - loss._forward(prediction, target_aligned)
+    ).double()
+
+    expected = kappa_value * (1 - np.cos(theta))
+    assert torch.isclose(
+        angular_part,
+        torch.tensor([expected], dtype=torch.float64),
+        rtol=1e-3,
+    )
+
+    # Extreme concentrations must not overflow values or gradients.
+    prediction_extreme = torch.tensor(
+        [[0.0, 0.0, 1.0, 1e7]], dtype=torch.float32, requires_grad=True
+    )
+    elements = loss._forward(prediction_extreme, target_off)
+    assert torch.all(torch.isfinite(elements))
+    elements.sum().backward()
+    assert torch.all(torch.isfinite(prediction_extreme.grad))
+
+
+@pytest.mark.parametrize("from_logits", [True, False])
+def test_focal_bce_reduces_to_weighted_bce(from_logits: bool) -> None:
+    """With gamma=0 the focal loss is the alpha-weighted BCE."""
+    torch.manual_seed(0)
+    logits = torch.randn(64, 1)
+    prediction = logits if from_logits else torch.sigmoid(logits)
+    target = torch.randint(0, 2, (64, 1)).float()
+    alpha = 0.3
+
+    focal = FocalBinaryCrossEntropyLoss(
+        gamma=0.0, alpha=alpha, from_logits=from_logits
+    )
+    bce = BinaryCrossEntropyLoss(from_logits=from_logits)
+    alpha_t = alpha * target + (1 - alpha) * (1 - target)
+    expected = alpha_t * bce(prediction, target, return_elements=True)
+
+    assert torch.allclose(
+        focal(prediction, target, return_elements=True), expected, atol=1e-6
+    )
+
+
+def test_focal_bce_logits_match_probabilities() -> None:
+    """Logit and probability inputs give the same focal loss."""
+    torch.manual_seed(0)
+    logits = torch.randn(64, 1)
+    target = torch.randint(0, 2, (64, 1)).float()
+
+    from_logits = FocalBinaryCrossEntropyLoss(from_logits=True)
+    from_probs = FocalBinaryCrossEntropyLoss(from_logits=False)
+
+    assert torch.allclose(
+        from_logits(logits, target, return_elements=True),
+        from_probs(torch.sigmoid(logits), target, return_elements=True),
+        atol=1e-5,
+    )
+
+
+def test_focal_bce_down_weights_easy_examples() -> None:
+    """A confident correct prediction is penalised less than by BCE."""
+    target = torch.ones(1, 1)
+    prediction = torch.tensor([[0.95]])
+    focal = FocalBinaryCrossEntropyLoss(gamma=2.0, alpha=0.5)
+    bce = BinaryCrossEntropyLoss()
+
+    assert focal(prediction, target) < 0.5 * bce(prediction, target)
+
+
+def test_cauchy_homoscedastic_closed_form() -> None:
+    """With frac=0 the loss is log(1 + (r/alpha)^2) + log(alpha)."""
+    alpha = 0.5
+    prediction = torch.tensor([[0.0, 1.0], [2.0, -1.0]])
+    target = torch.tensor([[0.5, 1.0], [0.0, 0.0]])
+    residual = (prediction - target).abs()
+    expected = torch.mean(
+        torch.log1p((residual / alpha) ** 2) + np.log(alpha), dim=-1
+    )
+
+    loss = CauchyLoss(alpha=alpha, frac=0.0)
+    assert torch.allclose(
+        loss(prediction, target, return_elements=True), expected
+    )
+
+
+def test_cauchy_heteroscedastic_uses_extra_columns() -> None:
+    """With frac=1 the columns after the target width are the scales."""
+    prediction = torch.tensor([[1.0, 2.0]])  # value, scale
+    target = torch.tensor([[0.0]])
+    expected = torch.log1p(torch.tensor(0.25)) + np.log(2.0)
+
+    loss = CauchyLoss(frac=1.0)
+    assert torch.allclose(loss(prediction, target), expected)
+
+
+def test_sp_cauchy_prefers_aligned_confident_prediction() -> None:
+    """The loss decreases towards the target and grows when confidently off."""
+    target = torch.tensor([[0.0, 0.0, 1.0]])
+    aligned = torch.tensor([[0.0, 0.0, 1.0, 10.0]])
+    orthogonal = torch.tensor([[1.0, 0.0, 0.0, 10.0]])
+    vague = torch.tensor([[1.0, 0.0, 0.0, 0.1]])
+    loss = spCauchyLoss()
+
+    assert loss(aligned, target) < loss(orthogonal, target)
+    assert loss(vague, target) < loss(orthogonal, target)
+
+
+@pytest.mark.parametrize("k", [0.3, 2.0, 10.0])
+def test_sp_cauchy_density_is_normalized(k: float) -> None:
+    """Exp(-loss) / (4 pi) integrates to one over the sphere (d = 3)."""
+    n = 400_000
+    i = torch.arange(n, dtype=torch.float64) + 0.5
+    z = 1 - 2 * i / n
+    phi = torch.pi * (1 + 5**0.5) * i
+    r = torch.sqrt(1 - z**2)
+    points = torch.stack([r * torch.cos(phi), r * torch.sin(phi), z], dim=1)
+    mu = torch.tensor([0.0, 0.0, 1.0]).expand(n, 3)
+    prediction = torch.cat([mu, torch.full((n, 1), k)], dim=1)
+
+    loss = spCauchyLoss()(prediction, points.float(), return_elements=True)
+    integral = torch.exp(-loss.double()).mean()  # mean over uniform points
+    assert torch.isclose(
+        integral, torch.tensor(1.0, dtype=torch.float64), rtol=1e-3
+    )
+
+
+def test_sp_cauchy_large_concentration_is_finite() -> None:
+    """Very confident predictions give finite losses and gradients."""
+    target = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+    prediction = torch.tensor(
+        [[0.0, 0.0, 1.0, 1e8], [0.0, 0.0, 1.0, 1e8]], requires_grad=True
+    )
+    loss = spCauchyLoss()(prediction, target, return_elements=True)
+    loss.sum().backward()
+    assert torch.isfinite(loss).all()
+    assert torch.isfinite(prediction.grad).all()
+    assert loss[0] < loss[1]
+
+
+@pytest.mark.parametrize(
+    "loss",
+    [
+        MAELoss(),
+        MSELoss(),
+        RMSELoss(),
+        LogCoshLoss(),
+        NegCosLoss(),
+        CauchyLoss(alpha=0.04, frac=0.0),
+        CauchyLoss(alpha=3.0, frac=0.0),
+        EnsembleLoss([MSELoss(), CauchyLoss(alpha=0.1, frac=0.0)], [2.0, 1.0]),
+    ],
+)
+def test_lower_bound_holds_and_is_reached(loss: LossFunction) -> None:
+    """The loss never goes below its bound and reaches it when exact."""
+    torch.manual_seed(0)
+    target = torch.randn(256, 3)
+    prediction = target + torch.randn(256, 3)
+    bound = loss.lower_bound
+    assert bound is not None
+    elements = loss(prediction, target, return_elements=True)
+    assert (elements >= bound - 1e-6).all()
+    assert torch.isclose(loss(target, target), torch.tensor(bound), atol=1e-6)
+
+
+@pytest.mark.parametrize("from_logits", [True, False])
+def test_binary_cross_entropy_lower_bound(from_logits: bool) -> None:
+    """(Focal) BCE is bounded by 0 and approaches it for confident hits."""
+    target = torch.tensor([[0.0], [1.0]])
+    confident = torch.tensor([[-30.0], [30.0]])
+    if not from_logits:
+        confident = torch.sigmoid(confident)
+    for loss in (
+        BinaryCrossEntropyLoss(from_logits=from_logits),
+        FocalBinaryCrossEntropyLoss(from_logits=from_logits),
+    ):
+        assert loss.lower_bound == 0.0
+        assert 0.0 <= float(loss(confident, target)) < 1e-6
+
+
+def test_unbounded_losses_have_no_lower_bound() -> None:
+    """Losses with a predicted concentration or scale report None."""
+    assert spCauchyLoss().lower_bound is None
+    assert VonMisesFisher3DLoss().lower_bound is None
+    assert CauchyLoss(frac=1.0).lower_bound is None
+    assert EnsembleLoss([MSELoss(), spCauchyLoss()]).lower_bound is None
+
+
+def test_cauchy_learned_alpha_converges_to_residual_scale() -> None:
+    """A learned alpha converges to the Cauchy scale of the residuals."""
+    torch.manual_seed(0)
+    scales = torch.tensor([0.02, 3.0])
+    residuals = (
+        torch.distributions.Cauchy(0.0, 1.0).sample((20000, 2)) * scales
+    )
+    loss = CauchyLoss(alpha=1.0, frac=0.0, learn_alpha=True, nb_outputs=2)
+    optimizer = torch.optim.Adam(loss.parameters(), lr=0.05)
+    zeros = torch.zeros_like(residuals)
+    for _ in range(400):
+        optimizer.zero_grad()
+        loss(residuals, zeros).backward()
+        optimizer.step()
+    learned = torch.exp(loss.log_alpha[0].detach())
+    assert torch.allclose(learned, scales, rtol=0.05)
+
+
+def test_cauchy_conditioned_alpha_separates_populations() -> None:
+    """Conditioning on a label gives each population its own scale."""
+    torch.manual_seed(0)
+    n = 20000
+    label = (torch.rand(n, 1) > 0.5).float()  # e.g. 1 = track, 0 = cascade
+    scale = torch.where(label > 0.5, 0.01, 1.0)
+    residuals = torch.distributions.Cauchy(0.0, 1.0).sample((n, 1)) * scale
+    target = torch.cat([torch.zeros(n, 1), label], dim=1)
+    loss = CauchyLoss(
+        alpha=0.1, frac=0.0, learn_alpha=True, nb_outputs=1, n_conditions=1
+    )
+    optimizer = torch.optim.Adam(loss.parameters(), lr=0.05)
+    for _ in range(600):
+        optimizer.zero_grad()
+        loss(residuals, target).backward()
+        optimizer.step()
+    base, slope = loss.log_alpha.detach()[:, 0]
+    assert torch.isclose(torch.exp(base), torch.tensor(1.0), rtol=0.1)
+    assert torch.isclose(torch.exp(base + slope), torch.tensor(0.01), rtol=0.1)
+
+
+def test_cauchy_learned_alpha_lower_bound() -> None:
+    """The bound is the batch-mean log(alpha), reached at zero residual."""
+    loss = CauchyLoss(
+        alpha=[0.1, 2.0],
+        frac=0.0,
+        learn_alpha=True,
+        nb_outputs=2,
+        n_conditions=1,
+    )
+    with torch.no_grad():
+        loss.log_alpha[1] = torch.tensor([-1.0, 0.5])
+    values = torch.randn(64, 2)
+    target = torch.cat([values, torch.rand(64, 1)], dim=1)
+    exact = loss(values, target)
+    assert loss.lower_bound is not None
+    assert torch.isclose(exact, torch.tensor(loss.lower_bound), atol=1e-6)
+    off = loss(values + 1.0, target, return_elements=True)
+    assert float(off.mean()) > loss.lower_bound
+
+
+def test_cauchy_groups_of_one_match_ungrouped() -> None:
+    """Singleton groups reproduce the column-wise loss."""
+    torch.manual_seed(0)
+    prediction, target = torch.randn(32, 3), torch.randn(32, 3)
+    plain = CauchyLoss(alpha=0.3, frac=0.0)
+    grouped = CauchyLoss(alpha=0.3, frac=0.0, groups=[[0], [1], [2]])
+    assert torch.allclose(
+        plain(prediction, target, return_elements=True),
+        grouped(prediction, target, return_elements=True),
+    )
+    assert np.isclose(plain.lower_bound, grouped.lower_bound)
+
+
+def test_cauchy_group_is_rotation_invariant() -> None:
+    """Within a group only the length of the residual matters."""
+    alpha = 0.1
+    target = torch.zeros(2, 3)
+    residuals = torch.tensor([[1.0, 0.0, 0.3], [0.6, -0.8, 0.3]])
+    grouped = CauchyLoss(alpha=alpha, frac=0.0, groups=[[0, 1], [2]])
+    loss = grouped(residuals, target, return_elements=True)
+    assert torch.isclose(loss[0], loss[1])
+    expected = (
+        1.5 * np.log1p(1.0 / alpha**2)
+        + np.log1p(0.09 / alpha**2)
+        + 3 * np.log(alpha)
+    ) / 3
+    assert torch.isclose(loss[0], torch.tensor(expected, dtype=torch.float))
+
+    plain = CauchyLoss(alpha=alpha, frac=0.0)(
+        residuals, target, return_elements=True
+    )
+    assert not torch.isclose(plain[0], plain[1])
+
+
+def test_cauchy_group_lower_bound() -> None:
+    """The bound is the size-weighted mean log(alpha), reached when exact."""
+    loss = CauchyLoss(
+        alpha=[0.05, 0.2, 3.0], frac=0.0, groups=[[0, 1], [2], [3]]
+    )
+    values = torch.randn(16, 4)
+    expected = (2 * np.log(0.05) + np.log(0.2) + np.log(3.0)) / 4
+    assert np.isclose(loss.lower_bound, expected)
+    assert torch.isclose(
+        loss(values, values), torch.tensor(expected, dtype=torch.float)
+    )
+    off = loss(values + 0.1, values, return_elements=True)
+    assert (off > expected).all()
+
+
+def test_cauchy_group_learned_alpha_is_likelihood_scale() -> None:
+    """Learned group scales recover those of multivariate Cauchy samples."""
+    torch.manual_seed(0)
+    n = 40000
+    scales = torch.tensor([0.05, 2.0])
+    # d-dimensional Cauchy: normal vector over an independent |normal|
+    pair = torch.randn(n, 2) / torch.randn(n, 1).abs() * scales[0]
+    single = torch.randn(n, 1) / torch.randn(n, 1).abs() * scales[1]
+    residuals = torch.cat([pair, single], dim=1)
+    loss = CauchyLoss(
+        alpha=1.0, frac=0.0, learn_alpha=True, groups=[[0, 1], [2]]
+    )
+    optimizer = torch.optim.Adam(loss.parameters(), lr=0.05)
+    zeros = torch.zeros_like(residuals)
+    for _ in range(400):
+        optimizer.zero_grad()
+        loss(residuals, zeros).backward()
+        optimizer.step()
+    assert torch.allclose(loss.alphas(), scales, rtol=0.05)
+    assert set(loss.monitored_values()) == {"alpha_0", "alpha_1"}
+    assert CauchyLoss(alpha=1.0, frac=0.0).monitored_values() == {}
+
+
+def test_sp_cauchy_fixed_rho_matches_predicted() -> None:
+    """A fixed rho equals the predicted form with k = rho / (1 - rho)."""
+    torch.manual_seed(0)
+    rho = 0.9
+    mu = torch.nn.functional.normalize(torch.randn(64, 3), dim=1)
+    target = torch.nn.functional.normalize(torch.randn(64, 3), dim=1)
+    k = torch.full((64, 1), rho / (1 - rho))
+    fixed = spCauchyLoss(rho=rho)(mu, target, return_elements=True)
+    predicted = spCauchyLoss()(
+        torch.cat([mu, k], dim=1), target, return_elements=True
+    )
+    assert torch.allclose(fixed, predicted, rtol=1e-5)
+
+
+def test_sp_cauchy_fixed_rho_is_chord_cauchy_with_bound() -> None:
+    """The loss is 2 log(1 + chord^2 / alpha^2) above its lower bound."""
+    rho = 0.995
+    loss = spCauchyLoss(rho=rho)
+    alpha_squared = (1 - rho) ** 2 / rho
+    torch.manual_seed(0)
+    mu = torch.nn.functional.normalize(torch.randn(64, 3), dim=1)
+    target = torch.nn.functional.normalize(torch.randn(64, 3), dim=1)
+    chord_squared = ((mu - target) ** 2).sum(dim=1)
+    expected = 2 * torch.log1p(chord_squared / alpha_squared)
+    elements = loss(mu, target, return_elements=True)
+    assert torch.allclose(elements - loss.lower_bound, expected, rtol=1e-4)
+    assert torch.isclose(
+        loss(target, target), torch.tensor(loss.lower_bound), atol=1e-5
+    )
+
+
+def test_cauchy_fixed_alpha_can_be_set() -> None:
+    """Setting alpha changes the loss and its bound; learned ones refuse."""
+    loss = CauchyLoss(alpha=0.1, frac=0.0)
+    assert hasattr(loss, "_alpha") and loss.alpha == 0.1
+    loss._alpha = 0.02
+    assert loss.alpha == 0.02
+    values = torch.randn(8, 2)
+    expected = torch.tensor(np.log(0.02), dtype=torch.float)
+    assert np.isclose(loss.lower_bound, float(expected))
+    assert torch.isclose(loss(values, values), expected)
+
+    learned = CauchyLoss(alpha=0.1, frac=0.0, learn_alpha=True, nb_outputs=2)
+    assert not hasattr(learned, "_alpha")
+    assert not hasattr(CauchyLoss(frac=1.0), "_alpha")
+
+
+def test_sp_cauchy_alpha_maps_to_rho() -> None:
+    """Alpha and rho are related by alpha^2 = (1 - rho)^2 / rho."""
+    loss = spCauchyLoss(rho=0.995)
+    assert np.isclose(loss.alpha, 0.005 / np.sqrt(0.995))
+    narrow_bound = loss.lower_bound
+    loss._alpha = 0.1
+    rho, wide_bound = loss._rho, loss.lower_bound
+    assert rho is not None
+    assert narrow_bound is not None and wide_bound is not None
+    assert np.isclose((1 - rho) ** 2 / rho, 0.01)
+    assert np.isclose(loss.alpha, 0.1)
+    assert wide_bound > narrow_bound
+    assert not hasattr(spCauchyLoss(), "_alpha")
+
+
+def test_cauchy_fixed_alpha_reports_residual_scales() -> None:
+    """A fixed-scale loss reports the Cauchy scale of its residuals."""
+    torch.manual_seed(0)
+    n = 40000
+    pair = torch.randn(n, 2) / torch.randn(n, 1).abs() * 0.05
+    single = torch.randn(n, 1) / torch.randn(n, 1).abs() * 2.0
+    residuals = torch.cat([pair, single], dim=1)
+    loss = CauchyLoss(alpha=0.3, frac=0.0, groups=[[0, 1], [2]])
+    assert loss.monitored_values() == {}
+    bound = loss.lower_bound
+    loss(residuals, torch.zeros_like(residuals))
+    values = loss.monitored_values()
+    assert np.isclose(values["residual_scale_0"], 0.05, rtol=0.05)
+    assert np.isclose(values["residual_scale_1"], 2.0, rtol=0.05)
+    # The estimate is a diagnostic only: alpha and the bound are unchanged
+    assert loss.alpha == 0.3
+    assert np.isclose(loss.lower_bound, bound)
+
+
+@pytest.mark.parametrize("from_logits", [True, False])
+def test_bce_label_smoothing_uses_smoothed_targets(from_logits: bool) -> None:
+    """Smoothing `eps` is BCE against targets `eps / 2` and `1 - eps / 2`."""
+    torch.manual_seed(0)
+    logits = torch.randn(64, 1)
+    prediction = logits if from_logits else torch.sigmoid(logits)
+    target = torch.randint(0, 2, (64, 1)).float()
+    eps = 0.1
+    smoothed = BinaryCrossEntropyLoss(
+        from_logits=from_logits, label_smoothing=eps
+    )
+    plain = BinaryCrossEntropyLoss(from_logits=from_logits)
+    soft_target = target * (1 - eps) + eps / 2
+    assert torch.allclose(
+        smoothed(prediction, target, return_elements=True),
+        plain(prediction, soft_target, return_elements=True),
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("eps", [0.0, 0.03, 0.2])
+def test_bce_label_smoothing_lower_bound_is_the_minimum(eps: float) -> None:
+    """The lower bound is the smallest loss, at logit log((2 - eps) / eps)."""
+    loss = BinaryCrossEntropyLoss(from_logits=True, label_smoothing=eps)
+    logits = torch.linspace(-30, 30, 600001).unsqueeze(1)
+    for label in (0.0, 1.0):
+        values = loss(
+            logits, torch.full_like(logits, label), return_elements=True
+        )
+        assert values.min().item() == pytest.approx(loss.lower_bound, abs=1e-6)
+        if eps > 0:
+            best = logits[values.argmin()].item()
+            sign = 1 if label else -1
+            # the loss is evaluated in float32: flat to ~1e-7 within ~5e-3
+            assert best == pytest.approx(
+                sign * np.log((2 - eps) / eps), abs=1e-2
+            )
+
+
+def test_focal_bce_label_smoothing_weights_with_hard_labels() -> None:
+    """With smoothing, alpha is applied by the hard label."""
+    torch.manual_seed(0)
+    logits = torch.randn(64, 1)
+    target = torch.randint(0, 2, (64, 1)).float()
+    alpha, eps = 0.3, 0.05
+    focal = FocalBinaryCrossEntropyLoss(
+        gamma=0.0, alpha=alpha, from_logits=True, label_smoothing=eps
+    )
+    bce = BinaryCrossEntropyLoss(from_logits=True, label_smoothing=eps)
+    alpha_t = alpha * target + (1 - alpha) * (1 - target)
+    assert torch.allclose(
+        focal(logits, target, return_elements=True),
+        alpha_t * bce(logits, target, return_elements=True),
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("alpha", [0.5, 0.9])
+def test_focal_bce_label_smoothing_lower_bound(alpha: float) -> None:
+    """The bound is min(alpha, 1 - alpha) H(eps / 2) for gamma 0, else 0."""
+    eps = 0.03
+    focal = FocalBinaryCrossEntropyLoss(
+        gamma=0.0, alpha=alpha, from_logits=True, label_smoothing=eps
+    )
+    q = eps / 2
+    entropy = -q * np.log(q) - (1 - q) * np.log(1 - q)
+    assert focal.lower_bound == pytest.approx(min(alpha, 1 - alpha) * entropy)
+    # reached for alpha = 0.5 by the optimal logits of a mixed batch
+    if alpha == 0.5:
+        target = torch.tensor([[1.0], [0.0], [1.0]])
+        best = np.log((2 - eps) / eps)
+        logits = (2 * target - 1) * best
+        assert focal(logits, target).item() == pytest.approx(
+            focal.lower_bound, rel=1e-5
+        )
+    assert FocalBinaryCrossEntropyLoss(
+        gamma=2.0, alpha=alpha, label_smoothing=eps
+    ).lower_bound == pytest.approx(0.0)
+
+
+def _unit_vectors(n: int, seed: int = 0) -> Tensor:
+    generator = torch.Generator().manual_seed(seed)
+    v = torch.randn(n, 3, generator=generator, dtype=torch.float64)
+    return v / v.norm(dim=1, keepdim=True)
+
+
+def test_spcauchy_knots_with_equal_rho_match_fixed_rho() -> None:
+    """Equal concentrations at all knots give the fixed-rho loss - its bound."""
+    prediction, target = _unit_vectors(50, 0), _unit_vectors(50, 1)
+    trackness = torch.rand(50, 1, dtype=torch.float64)
+    fixed = spCauchyLoss(rho=0.97)
+    knots = spCauchyLoss(rho=[0.97, 0.97, 0.97], rho_knots=[0.0, 0.5, 1.0])
+    expected = fixed(prediction, target, return_elements=True)
+    expected = expected - fixed.lower_bound
+    got = knots(
+        prediction,
+        torch.cat([target, trackness], dim=1),
+        return_elements=True,
+    )
+    assert torch.allclose(got.double(), expected.double(), atol=1e-5)
+
+
+def test_spcauchy_knots_interpolate_log_alpha() -> None:
+    """At a knot the knot's scale is used, between knots log(alpha) is
+    lerped."""
+    rho, knots = [0.93, 0.98, 0.994], [0.0, 0.9, 1.0]
+    loss = spCauchyLoss(rho=rho, rho_knots=knots)
+    alphas = loss.alphas
+    prediction = _unit_vectors(4, 2)
+    target = _unit_vectors(4, 3)
+    trackness = torch.tensor(
+        [[-1.0], [0.9], [0.95], [2.0]], dtype=torch.float64
+    )
+    got = loss(
+        prediction, torch.cat([target, trackness], 1), return_elements=True
+    )
+    u = 0.5 * ((prediction - target) ** 2).sum(1)
+    expected_alpha = torch.tensor(
+        [
+            alphas[0],  # clamped below the first knot
+            alphas[1],
+            np.sqrt(alphas[1] * alphas[2]),  # midway in log(alpha)
+            alphas[2],  # clamped above the last knot
+        ],
+        dtype=torch.float64,
+    )
+    expected = 2 * torch.log1p(2 * u / expected_alpha**2)
+    assert torch.allclose(got.double(), expected, rtol=1e-5)
+
+
+def test_spcauchy_knots_bound_is_zero_and_reached() -> None:
+    """The loss is non-negative and 0 for exact predictions."""
+    loss = spCauchyLoss(rho=[0.93, 0.994], rho_knots=[0.0, 1.0])
+    assert loss.lower_bound == 0.0
+    target = _unit_vectors(20, 4)
+    trackness = torch.rand(20, 1, dtype=torch.float64)
+    full_target = torch.cat([target, trackness], 1)
+    assert loss(target, full_target, return_elements=True).abs().max() < 1e-6
+    elements = loss(_unit_vectors(20, 5), full_target, return_elements=True)
+    assert (elements >= 0).all()
+
+
+def test_spcauchy_knots_alpha_setter() -> None:
+    """`alphas` is one value per knot; a scalar sets all knots (annealing)."""
+    loss = spCauchyLoss(rho=[0.93, 0.994], rho_knots=[0.0, 1.0])
+    alphas = loss.alphas
+    assert len(alphas) == 2
+    with pytest.raises(AttributeError):
+        loss.alpha
+    loss._alpha = 0.1  # as set by the annealing callback
+    assert loss._alpha == pytest.approx([0.1, 0.1])
+    loss._alpha = np.asarray(alphas)
+    assert loss._rho_values == pytest.approx([0.93, 0.994])
+
+
+def test_spcauchy_knots_need_the_property_column() -> None:
+    """A target without the extra column is rejected."""
+    loss = spCauchyLoss(rho=[0.93, 0.994], rho_knots=[0.0, 1.0])
+    with pytest.raises(AssertionError):
+        loss(_unit_vectors(3, 6), _unit_vectors(3, 7))
+    with pytest.raises(AssertionError):
+        spCauchyLoss(rho=[0.93, 0.994])
+    with pytest.raises(AssertionError):
+        spCauchyLoss(rho=0.9, rho_knots=[0.0])
+
+
+def _grouped_cauchy(alpha: Any = (0.01, 0.02, 0.5)) -> CauchyLoss:
+    return CauchyLoss(alpha=list(alpha), groups=[[0, 1], [2], [3]], frac=0.0)
+
+
+def test_cauchy_device_matches_cpu() -> None:
+    """Loss, bound and residual scales do not depend on the device."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    torch.manual_seed(0)
+    prediction, target = torch.randn(500, 4), torch.randn(500, 4)
+    cpu, gpu = _grouped_cauchy(), _grouped_cauchy()
+    loss_cpu = cpu(prediction, target, return_elements=True)
+    loss_gpu = gpu(prediction.cuda(), target.cuda(), return_elements=True)
+    assert torch.allclose(loss_cpu, loss_gpu.cpu(), rtol=1e-5, atol=1e-6)
+    assert cpu.lower_bound == gpu.lower_bound
+    for key, value in cpu.monitored_values().items():
+        assert np.isclose(gpu.monitored_values()[key], value, rtol=1e-5)
+
+
+def test_cauchy_fixed_alpha_does_not_synchronise() -> None:
+    """A fixed-scale (grouped) loss never waits for the GPU."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    grouped, single = _grouped_cauchy(), CauchyLoss(alpha=0.1, frac=0.0)
+    prediction = torch.randn(64, 4, device="cuda")
+    target = torch.randn(64, 4, device="cuda")
+    # the first call copies the fixed tensors to the GPU (once)
+    grouped(prediction, target)
+    single(prediction, target)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        grouped(prediction, target)
+        single(prediction, target)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def test_cauchy_new_alpha_replaces_the_device_copies() -> None:
+    """Setting alpha after a call matches a loss built with that alpha."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(1)
+    prediction = torch.randn(100, 4, device=device)
+    target = torch.randn(100, 4, device=device)
+    annealed = _grouped_cauchy()
+    annealed(prediction, target)
+    annealed._alpha = [0.1, 0.2, 0.3]
+    fresh = _grouped_cauchy([0.1, 0.2, 0.3])
+    assert torch.equal(
+        annealed(prediction, target, return_elements=True),
+        fresh(prediction, target, return_elements=True),
+    )
+    assert annealed.lower_bound == fresh.lower_bound
+
+
+def test_spcauchy_knots_do_not_synchronise_and_follow_new_scales() -> None:
+    """No GPU synchronisation per call; a new scale is used at once."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    loss = spCauchyLoss(rho=[0.93, 0.994], rho_knots=[0.0, 1.0])
+    prediction = _unit_vectors(30, 8).float().to(device)
+    target = (
+        torch.cat(
+            [_unit_vectors(30, 9), torch.rand(30, 1, dtype=torch.float64)], 1
+        )
+        .float()
+        .to(device)
+    )
+    before = loss(prediction, target, return_elements=True)
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            loss(prediction, target)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    loss._alpha = 0.1
+    fresh = spCauchyLoss(rho=[0.93, 0.994], rho_knots=[0.0, 1.0])
+    fresh._alpha = 0.1
+    after = loss(prediction, target, return_elements=True)
+    assert not torch.allclose(before, after)
+    assert torch.equal(after, fresh(prediction, target, return_elements=True))
+
+
+def test_spcauchy_two_property_knots_reduce_to_one_property() -> None:
+    """A grid constant along the second property equals the 1-D knots."""
+    rho, knots = [0.93, 0.98, 0.994], [0.0, 0.9, 1.0]
+    one = spCauchyLoss(rho=rho, rho_knots=knots)
+    two = spCauchyLoss(
+        rho=[[r, r] for r in rho],
+        rho_knots=knots,
+        rho_knots_2=[0.0, 2000.0],
+    )
+    prediction, target = _unit_vectors(40, 10), _unit_vectors(40, 11)
+    trackness = torch.rand(40, 1, dtype=torch.float64)
+    length = 3000 * torch.rand(40, 1, dtype=torch.float64)
+    expected = one(
+        prediction, torch.cat([target, trackness], 1), return_elements=True
+    )
+    got = two(
+        prediction,
+        torch.cat([target, trackness, length], 1),
+        return_elements=True,
+    )
+    assert torch.allclose(got, expected, rtol=1e-6)
+
+
+def test_spcauchy_two_property_knots_interpolate_bilinearly() -> None:
+    """Log(alpha) is bilinear in the cell and clamped beyond the grid."""
+    rho = [[0.90, 0.95], [0.98, 0.995]]
+    loss = spCauchyLoss(
+        rho=rho, rho_knots=[0.0, 1.0], rho_knots_2=[100.0, 1100.0]
+    )
+    log_alpha = np.log(np.asarray(loss.alphas))
+    assert log_alpha.shape == (2, 2)
+    prediction, target = _unit_vectors(3, 12), _unit_vectors(3, 13)
+    properties = torch.tensor(
+        [[0.5, 600.0], [1.0, 100.0], [2.0, 5000.0]], dtype=torch.float64
+    )
+    got = loss(
+        prediction, torch.cat([target, properties], 1), return_elements=True
+    )
+    u = 0.5 * ((prediction - target) ** 2).sum(1)
+    expected_alpha = torch.tensor(
+        np.exp(
+            [
+                log_alpha.mean(),  # centre of the cell
+                log_alpha[1, 0],  # at a corner
+                log_alpha[1, 1],  # clamped beyond both edges
+            ]
+        ),
+        dtype=torch.float64,
+    )
+    expected = 2 * torch.log1p(2 * u / expected_alpha**2)
+    assert torch.allclose(got.double(), expected, rtol=1e-5)
+    assert loss.lower_bound == 0.0
+
+
+def test_spcauchy_two_property_knots_alpha_setter() -> None:
+    """`alphas` is nested like `rho`; a scalar or a grid sets the knots."""
+    rho = [[0.90, 0.95, 0.97], [0.98, 0.99, 0.995]]
+    loss = spCauchyLoss(
+        rho=rho, rho_knots=[0.0, 1.0], rho_knots_2=[0.0, 500.0, 1500.0]
+    )
+    alphas = loss.alphas
+    assert np.shape(alphas) == (2, 3)
+    loss._alpha = 0.1  # as set by the annealing callback
+    assert np.allclose(loss._alpha, 0.1)
+    # the annealing callback interpolates element-wise in log space
+    schedule = np.logspace(np.log10(0.1), np.log10(np.asarray(alphas)), 3)
+    loss._alpha = schedule[-1].tolist()
+    assert np.allclose(loss._rho_values, rho)
+
+
+def test_spcauchy_two_property_knots_check_shapes() -> None:
+    """Grid shape, knot order and the two property columns are checked."""
+    with pytest.raises(AssertionError):
+        spCauchyLoss(rho=[0.9, 0.95], rho_knots=[0.0, 1.0], rho_knots_2=[0.0])
+    with pytest.raises(AssertionError):
+        spCauchyLoss(
+            rho=[[0.9, 0.95], [0.97, 0.99]],
+            rho_knots=[0.0, 1.0],
+            rho_knots_2=[1.0, 0.0],
+        )
+    with pytest.raises(AssertionError):
+        spCauchyLoss(rho=0.9, rho_knots_2=[0.0, 1.0])
+    loss = spCauchyLoss(
+        rho=[[0.9, 0.95], [0.97, 0.99]],
+        rho_knots=[0.0, 1.0],
+        rho_knots_2=[0.0, 1000.0],
+    )
+    one_column = torch.cat(
+        [_unit_vectors(3, 14), torch.rand(3, 1, dtype=torch.float64)], 1
+    )
+    with pytest.raises(AssertionError):
+        loss(_unit_vectors(3, 15), one_column)

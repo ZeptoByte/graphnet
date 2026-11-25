@@ -98,7 +98,6 @@ def main(
     os.makedirs(path, exist_ok=True)
     logger.info(f"Writing results to {path}")
     model.save_state_dict(f"{path}/state_dict.pth")
-    model.save(f"{path}/model.pth")
 
     # Get predictions
     if isinstance(config.target, str):
@@ -119,11 +118,9 @@ def main(
 
 if __name__ == "__main__":
     # Parse command-line arguments
-    parser = ArgumentParser(
-        description="""
+    parser = ArgumentParser(description="""
 Train GNN model.
-"""
-    )
+""")
 
     parser.with_standard_arguments(
         "dataset-config",
@@ -132,7 +129,7 @@ Train GNN model.
         ("max-epochs", 1),
         "early-stopping-patience",
         ("batch-size", 16),
-        "num-workers",
+        ("num-workers", 2),
     )
 
     parser.add_argument(

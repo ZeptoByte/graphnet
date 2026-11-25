@@ -27,7 +27,6 @@ from graphnet.models.graphs import KNNGraph
 from graphnet.models.graphs.nodes import NodesAsPulses
 from graphnet.training.utils import save_selection
 
-
 graph_definition = KNNGraph(
     detector=IceCubeDeepCore(),
     node_definition=NodesAsPulses(),
@@ -101,7 +100,7 @@ def dataset_setup(dataset_ref: pytest.FixtureRequest) -> tuple:
     dataset_kwargs = {
         "truth_table": "mc_truth",
         "pulsemaps": "total",
-        "truth": TRUTH.PROMETHEUS,
+        "truth": TRUTH.PROMETHEUS_LEGACY,
         "features": FEATURES.PROMETHEUS,
         "path": data_path,
         "graph_definition": graph_definition,
@@ -166,7 +165,7 @@ def test_weighted_sampler_respects_selection_and_shuffle(
     }
     _make_weighted_db(source_db, target_db, truth_table, weight_table, weights)
 
-    dataset_kwargs = {
+    dataset_kwargs: Dict[str, Any] = {
         "truth_table": truth_table,
         "pulsemaps": "total",
         "truth": TRUTH.PROMETHEUS,
@@ -189,6 +188,57 @@ def test_weighted_sampler_respects_selection_and_shuffle(
     assert isinstance(loader.sampler, WeightedRandomSampler)
     expected = np.asarray([1.0, 2.0, 3.0, 4.0]) / 10.0
     np.testing.assert_allclose(loader.sampler._weights.numpy(), expected)
+
+
+def test_weighted_sampler_resample(tmp_path: str) -> None:
+    """Test that `resample=False` repeats the index sequence."""
+    source_db = os.path.join(
+        EXAMPLE_DATA_DIR, "sqlite", "prometheus", "prometheus-events.db"
+    )
+    target_db = os.path.join(tmp_path, "weighted.db")
+    truth_table = "mc_truth"
+    weight_table = "sampling_weights"
+    event_nos = _get_event_nos(source_db, truth_table)
+    weights = {event_no: 1.0 for event_no in event_nos}
+    _make_weighted_db(source_db, target_db, truth_table, weight_table, weights)
+    dataset = SQLiteDataset(
+        path=target_db,
+        pulsemaps="total",
+        truth_table=truth_table,
+        truth=TRUTH.PROMETHEUS,
+        features=FEATURES.PROMETHEUS,
+        graph_definition=graph_definition,
+        loss_weight_table=weight_table,
+        loss_weight_column="weight",
+    )
+
+    sampler = WeightedRandomSampler(dataset, num_samples=50)
+    assert sampler.resample
+    assert list(sampler) != list(sampler)
+
+    sampler.resample = False
+    first = list(sampler)
+    assert list(sampler) == first
+    assert len(first) == 50
+
+    fixed = WeightedRandomSampler(dataset, num_samples=50, resample=False)
+    assert list(fixed) == list(fixed)
+
+    # One repeat leaves the later draws unchanged
+    reference = WeightedRandomSampler(
+        dataset, num_samples=50, generator=torch.Generator().manual_seed(1)
+    )
+    sampler = WeightedRandomSampler(
+        dataset, num_samples=50, generator=torch.Generator().manual_seed(1)
+    )
+    with pytest.raises(RuntimeError):
+        sampler.repeat_last_draw()
+    draws = [list(reference) for _ in range(3)]
+    assert list(sampler) == draws[0]
+    sampler.repeat_last_draw()
+    assert list(sampler) == draws[0]
+    assert list(sampler) == draws[1]
+    assert list(sampler) == draws[2]
 
 
 def test_weighted_sampler_supports_ensemble_dataset(tmp_path: str) -> None:
@@ -273,7 +323,7 @@ def test_save_selection(selection: List[int], file_path: str) -> None:
     "dataset_ref", [SQLiteDataset, ParquetDataset], indirect=True
 )
 def test_single_dataset_without_selections(
-    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]]
+    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]],
 ) -> None:
     """Verify GraphNeTDataModule behavior when no test selection is provided.
 
@@ -313,7 +363,7 @@ def test_single_dataset_without_selections(
     "dataset_ref", [SQLiteDataset, ParquetDataset], indirect=True
 )
 def test_single_dataset_with_selections(
-    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]]
+    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]],
 ) -> None:
     """Test that selection functionality of DataModule behaves as expected.
 
@@ -376,7 +426,7 @@ def test_single_dataset_with_selections(
     "dataset_ref", [SQLiteDataset, ParquetDataset], indirect=True
 )
 def test_dataloader_args(
-    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]]
+    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]],
 ) -> None:
     """Test that arguments to dataloaders are propagated correctly.
 
@@ -417,7 +467,7 @@ def test_dataloader_args(
     "dataset_ref", [SQLiteDataset, ParquetDataset], indirect=True
 )
 def test_ensemble_dataset_without_selections(
-    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]]
+    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]],
 ) -> None:
     """Test ensemble dataset functionality without selections.
 
@@ -456,7 +506,7 @@ def test_ensemble_dataset_without_selections(
 
 @pytest.mark.parametrize("dataset_ref", [SQLiteDataset, ParquetDataset])
 def test_ensemble_dataset_with_selections(
-    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]]
+    dataset_setup: Tuple[Any, Dict[str, Any], Dict[str, int]],
 ) -> None:
     """Test ensemble dataset functionality with selections.
 

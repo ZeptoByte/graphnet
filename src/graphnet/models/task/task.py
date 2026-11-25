@@ -1,14 +1,15 @@
 """Base physics task-specific `Model` class(es)."""
 
 from abc import abstractmethod
-from typing import Any, TYPE_CHECKING, List, Tuple, Union
-from typing import Callable, Optional
+from contextlib import nullcontext
+from typing import Any, TYPE_CHECKING, Dict, List, Tuple, Union
+from typing import Callable, ContextManager, Optional
 import numpy as np
 from copy import deepcopy
 
 import torch
 from torch import Tensor
-from torch.nn import Linear
+from torch.nn import Linear, Identity
 from torch_geometric.data import Data
 
 if TYPE_CHECKING:
@@ -18,12 +19,26 @@ if TYPE_CHECKING:
     )  # noqa: E501 # type: ignore[attr-defined]
 
 from graphnet.models import Model
+from graphnet.models.task.heads import MLPHead, TaskHead
 from graphnet.utilities.decorators import final
 from graphnet.models.utils import get_fields
 from graphnet.utilities.imports import has_jammy_flows_package
 
 if has_jammy_flows_package():
     import jammy_flows
+
+
+def _full_precision(x: Union[Tensor, Data]) -> ContextManager:
+    """Return a context disabling autocast on the device of `x`."""
+    device = x.device if isinstance(x, Tensor) else None
+    if device is None or device.type not in ("cuda", "cpu"):
+        return nullcontext()
+    return torch.autocast(device_type=device.type, enabled=False)
+
+
+def _identity(x: Union[Tensor, Data]) -> Union[Tensor, Data]:
+    """Return `x` unchanged; default (picklable) task transform."""
+    return x
 
 
 class Task(Model):
@@ -54,6 +69,7 @@ class Task(Model):
         transform_inference: Optional[Callable] = None,
         transform_support: Optional[Tuple] = None,
         loss_weight: Optional[str] = None,
+        reference_labels: Optional[Dict[str, str]] = None,
     ):
         """Construct `Task`.
 
@@ -87,6 +103,16 @@ class Task(Model):
                 is tested on the range [-1e6, 1e6].
             loss_weight: Name of the attribute in `data` containing per-event
                 loss weights.
+            reference_labels: Predictions that are relative to a per-event
+                reference, mapped to the attribute in `data` holding it, e.g.
+                `{"time_pred": "reference_time"}` for a time relative to a
+                time reference that the graph definition adds to each event.
+                The prediction and the target at the same position are
+                relative to it: in training the reference is subtracted from
+                that target column before `transform_target`, and in
+                inference `StandardModel` adds it back to the prediction
+                after `transform_inference`, so the model returns the
+                absolute quantity.
         """
         # Base class constructor
         super().__init__()
@@ -109,16 +135,28 @@ class Task(Model):
         self._prediction_labels = prediction_labels
         self._inference = False
         self._loss_weight = loss_weight
+        self._reference_columns: List[Tuple[int, str]] = []
+        for label, attribute in (reference_labels or {}).items():
+            assert label in prediction_labels, (
+                f"reference_labels: '{label}' is not a prediction label "
+                f"{prediction_labels}"
+            )
+            column = prediction_labels.index(label)
+            assert column < len(target_labels), (
+                f"reference_labels: '{label}' (column {column}) has no "
+                f"target column {target_labels}"
+            )
+            self._reference_columns.append((column, attribute))
 
+        # Named identity rather than lambdas, so that tasks stay picklable
+        # (e.g. for multi-process data loading and DDP spawning).
         self._transform_prediction_training: Callable[[Tensor], Tensor] = (
-            self.identity_transform
+            _identity
         )
         self._transform_prediction_inference: Callable[[Tensor], Tensor] = (
-            self.identity_transform
+            _identity
         )
-        self._transform_target: Callable[[Tensor], Tensor] = (
-            self.identity_transform
-        )
+        self._transform_target: Callable[[Tensor], Tensor] = _identity
         self._validate_and_set_transforms(
             transform_prediction_and_target,
             transform_target,
@@ -126,11 +164,36 @@ class Task(Model):
             transform_support,
         )
 
+    @property
+    def reference_attributes(self) -> List[str]:
+        """Return the attributes in `data` holding per-event references."""
+        return list(dict.fromkeys(a for _, a in self._reference_columns))
+
+    def add_references(
+        self, prediction: Union[Tensor, Data], data: List[Data]
+    ) -> Union[Tensor, Data]:
+        """Add the per-event references to an inference-mode prediction.
+
+        Training-mode predictions are returned unchanged: there the target is
+        made relative instead (see `reference_labels`).
+        """
+        if not (self._inference and self._reference_columns):
+            return prediction
+        assert isinstance(prediction, Tensor), "references need a Tensor"
+        prediction = prediction.clone()
+        for column, attribute in self._reference_columns:
+            reference = torch.cat([d[attribute].reshape(-1) for d in data]).to(
+                prediction.device, torch.float64
+            )
+            prediction[:, column] = (
+                prediction[:, column].double() + reference
+            ).to(prediction.dtype)
+        return prediction
+
     @final
     def _transform_prediction(
         self, prediction: Union[Tensor, Data]
     ) -> Union[Tensor, Data]:
-
         if self._inference:
             return self._transform_prediction_inference(prediction)
         else:
@@ -156,8 +219,8 @@ class Task(Model):
     ) -> None:
         """Validate and set transforms.
 
-        Assert that a valid combination of transformation arguments are passed
-        and update the corresponding functions.
+        Assert that a valid combination of transformation arguments are
+        passed and update the corresponding functions.
         """
         # Checks
         assert not (
@@ -225,12 +288,6 @@ class Task(Model):
             if transform_inference is not None:
                 self._transform_prediction_inference = transform_inference
 
-    def identity_transform(
-        self, x: Union[Tensor, Data]
-    ) -> Union[Tensor, Data]:
-        """Identity transform."""
-        return x
-
 
 class LearnedTask(Task):
     """Task class with a learned mapping.
@@ -244,7 +301,9 @@ class LearnedTask(Task):
         self,
         hidden_size: int,
         loss_function: "LossFunction",
+        disable_affine: bool = False,
         detach_backbone: bool = False,
+        head: Optional[Union[List[int], TaskHead]] = None,
         **task_kwargs: Any,
     ):
         """Construct `LearnedTask`.
@@ -254,13 +313,36 @@ class LearnedTask(Task):
                          the last latent layer of `Model` using this Task.
                          Available through `Model.nb_outputs`
             loss_function: Loss function appropriate to the task.
+            disable_affine: If True, replace the linear projection from
+                            `hidden_size` to `nb_inputs` with an identity.
+                            Use when the upstream model already produces
+                            an output of the right dimensionality.
+            detach_backbone: If True, the task input is detached, such that
+                            this task's loss does not propagate gradients
+                            into the model producing it.
+            head: Mapping from `hidden_size` to `nb_inputs` columns instead
+                  of the default single linear layer. Either a `TaskHead`
+                  (e.g. `MLPHead`), which the task builds with these sizes,
+                  or a list of hidden-layer widths as shorthand for
+                  `MLPHead(hidden_layers=head)` with default options.
         """
         # Base class constructor
         super().__init__(**task_kwargs)
 
         # Mapping from last hidden layer to required size of input
         self._loss_function = loss_function
-        self._affine = Linear(hidden_size, self.nb_inputs)
+        self._disable_affine = disable_affine
+        if self._disable_affine:
+            assert (
+                head is None
+            ), "`head` cannot be combined with `disable_affine`."
+            self._affine: torch.nn.Module = Identity()
+        elif head is not None:
+            if not isinstance(head, TaskHead):
+                head = MLPHead(hidden_layers=list(head))
+            self._affine = head.build(hidden_size, self.nb_inputs)
+        else:
+            self._affine = Linear(hidden_size, self.nb_inputs)
         self._detach_backbone = detach_backbone
 
     @abstractmethod
@@ -288,15 +370,21 @@ class LearnedTask(Task):
     ) -> Union[Tensor, Data]:
         """Forward call for `LearnedTask`.
 
-        The learned embedding transforms last latent layer of Model to meet
-        target dimensions.
+        The learned embedding transforms last latent layer of Model to
+        meet target dimensions. The head always runs in float32, also under
+        mixed-precision autocast: the outputs are the final predictions,
+        and rounding them to e.g. bfloat16 (8 significant bits) would be
+        coarser than the resolution many tasks aim for.
         """
         self._regularisation_loss = 0  # Reset
-        if self._detach_backbone == True:
+        if self._detach_backbone:
             x = x.detach()
-        x = self._affine(x)
-        x = self._forward(x=x)
-        return self._transform_prediction(x)
+        with _full_precision(x):
+            if isinstance(x, Tensor):
+                x = x.float()
+            x = self._affine(x)
+            x = self._forward(x=x)
+            return self._transform_prediction(x)
 
 
 class StandardLearnedTask(LearnedTask):
@@ -341,20 +429,29 @@ class StandardLearnedTask(LearnedTask):
         """Compute supervised learning loss.
 
         Grabs truth labels in `data` and sends both `pred` and `target` to loss
-        function for evaluation. Suits most supervised learning `Task`s.
+        function for evaluation. Suits most supervised learning `Task`s. The
+        loss is evaluated in float32, also under mixed-precision autocast.
         """
-        target = torch.stack(
-            [data[label] for label in self._target_labels], dim=1
-        )
+        with _full_precision(pred):
+            return self._compute_loss(pred, data)
+
+    def _compute_loss(self, pred: Union[Tensor, Data], data: Data) -> Tensor:
+        if isinstance(pred, Tensor):
+            pred = pred.float()
+        columns = [data[label] for label in self._target_labels]
+        for column, attribute in self._reference_columns:
+            # in float64: e.g. times of ~1e4 ns relative to a ~1e4 ns reference
+            columns[column] = (
+                columns[column].double() - data[attribute].double()
+            ).to(columns[column].dtype)
+        target = torch.stack(columns, dim=1)
         target = self._transform_target(target)
         if self._loss_weight is not None:
-            weights = data[self._loss_weight]
-            if isinstance(w, torch.Tensor):
-                weights = weights.to(device=target.device, dtype=target.dtype)
-            else:
-                weights = torch.as_tensor(
-                    w, device=target.device, dtype=target.dtype
-                )
+            weights = torch.as_tensor(
+                data[self._loss_weight],
+                device=target.device,
+                dtype=target.dtype,
+            )
         else:
             weights = None
 
@@ -422,39 +519,57 @@ class IdentityTask(StandardLearnedTask):
 
 
 class IdentityTaskWithUncertainty(IdentityTask):
-    """Identity task with uncertainty.
+    """Identity task that also predicts a positive scale for each output.
 
-    This task returns the input as is, but also returns an uncertainty value
-    for each target.
+    The task returns `nb_outputs` values followed by `nb_outputs` scales
+    (uncertainties), e.g. for the heteroscedastic term of `CauchyLoss`. The
+    scale is the exponential of the raw output, so that the raw output is
+    the log-scale and the scale starts out of order one. With
+    `shape_output`, `nb_outputs` shape parameters follow, e.g. the degrees
+    of freedom of `StudentTLoss`.
     """
 
     def __init__(
         self,
         nb_outputs: int,
-        nb_errors: int,
         target_labels: Union[List[str], Any],
-        beta: float = 0.1,
-        threshold: float = 20.0,
         *args: Any,
+        shape_output: bool = False,
         **kwargs: Any,
     ):
-        """Construct IdentityWithUncertainty."""
-        super().__init__(nb_outputs, target_labels, *args, **kwargs)
-        self._default_prediction_labels = [
-            f"{label}_pred" for label in self._default_target_labels
-        ] + [f"{label}_uncertainty" for label in self._default_target_labels]
+        """Construct IdentityTaskWithUncertainty.
 
-        self._beta = beta
-        self._threshold = threshold
-        self._nb_errors = nb_errors
+        Args:
+            nb_outputs: Number of predicted values; the task has twice as
+                many outputs (three times with `shape_output`).
+            target_labels: Target label(s).
+            shape_output: If True, also predict a shape parameter per value,
+                `nu = exp(raw output)` in [0.25, 100]. A zero output gives
+                `nu = 1` (Cauchy for `StudentTLoss`).
+        """
+        n_blocks = 3 if shape_output else 2
+        super().__init__(n_blocks * nb_outputs, target_labels, *args, **kwargs)
+        self._nb_values = nb_outputs
+        self._shape_output = shape_output
+        self._default_prediction_labels = [
+            f"target_{i}_pred" for i in range(nb_outputs)
+        ] + [f"target_{i}_scale" for i in range(nb_outputs)]
+        if shape_output:
+            self._default_prediction_labels += [
+                f"target_{i}_shape" for i in range(nb_outputs)
+            ]
 
     def _forward(self, x: Union[Tensor, Data]) -> Tensor:  # type: ignore
-        sigma = torch.nn.functional.softplus(
-            x[:, -self._nb_errors :],
-            beta=self._beta,
-            threshold=self._threshold,
-        )
-        return torch.hstack([x[:, : -self._nb_errors], sigma])
+        n = self._nb_values
+        values = x[:, :n]
+        log_scale = x[:, n : 2 * n].clamp(min=-20.0, max=20.0)
+        outputs = [values, torch.exp(log_scale)]
+        if self._shape_output:
+            log_shape = x[:, 2 * n :].clamp(
+                min=np.log(0.25), max=np.log(100.0)
+            )
+            outputs.append(torch.exp(log_shape))
+        return torch.cat(outputs, dim=1)
 
 
 class StandardFlowTask(Task):
@@ -542,3 +657,62 @@ class StandardFlowTask(Task):
         # Compute nllh
         x = self._forward(x, labels)
         return self._transform_prediction(x)
+
+
+class UnsupervisedTask(Task):
+    """A `Task` for Unsupervised training with augmentations."""
+
+    def __init__(
+        self,
+        augment_like: Model,
+        loss_computation: Model,
+        **task_kwargs: Any,
+    ):
+        """Construct `UnsupervisedTask`.
+
+        Args:
+            augment_like: a model to manipulate the data in desired way.
+            Make sure that outputs match required inputs of loss_computation.
+            This is also the opportunity to extract all that is needed downstream
+            like a custom additional target.
+            loss_computation: second step in task that calculates the loss e.g.
+            based on the model output and extracted nodes
+        """
+        # only needed for task to work, not actually relevant
+        self._default_target_labels = ["t", "q"]
+        self._default_prediction_labels = [
+            s + "_pred" for s in self._default_target_labels
+        ]
+        self._hidden_size = 4
+
+        super().__init__(**task_kwargs)
+        self.aug = augment_like
+        self.loss = loss_computation
+
+    @property
+    def default_target_labels(self) -> List[str]:
+        """Return default target labels."""
+        return self._default_target_labels
+
+    @property
+    def default_prediction_labels(self) -> List[str]:
+        """Return default prediction labels."""
+        return self._default_prediction_labels
+
+    def nb_inputs(self) -> int:  # type: ignore
+        """Return number of conditional inputs assumed by task."""
+        return self._hidden_size
+
+    def augment(self, data: Data) -> Data:
+        """Perform augmentation or similar."""
+        aug_out = self.aug(data)
+        self.aug_aux = aug_out[1:]
+        return aug_out[0]
+
+    def compute_loss(self, pred: Tensor, data: Data) -> Tensor:
+        """Perform loss calc with model output, data and aux from augment."""
+        assert (
+            self.aug_aux is not None
+        ), "augmentation or similar must happen before loss calc"
+
+        return self.loss(pred, data, self.aug_aux)

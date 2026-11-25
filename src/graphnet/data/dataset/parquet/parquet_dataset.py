@@ -22,6 +22,7 @@ from graphnet.models.data_representation import (
     GraphDefinition,
     DataRepresentation,
 )
+from graphnet.data.augmentation import DataAugmentation
 from graphnet.data.dataset import Dataset
 from graphnet.exceptions.exceptions import ColumnMissingException
 
@@ -51,6 +52,7 @@ class ParquetDataset(Dataset):
         seed: Optional[int] = None,
         cache_size: int = 1,
         labels: Optional[Dict[str, Any]] = None,
+        augmentations: Optional[List[DataAugmentation]] = None,
     ):
         """Construct Dataset.
 
@@ -102,6 +104,8 @@ class ParquetDataset(Dataset):
             cache_size: Number of files to cache in memory.
                         Must be at least 1. Defaults to 1.
             labels: Dictionary of labels to be added to the dataset.
+            augmentations: Data augmentations applied to the input rows of
+                every event each time it is read (see `Dataset`).
         """
         self._validate_selection(selection)
         # Base class constructor
@@ -124,6 +128,7 @@ class ParquetDataset(Dataset):
             graph_definition=graph_definition,
             data_representation=data_representation,
             labels=labels,
+            augmentations=augmentations,
         )
 
         # mypy..
@@ -258,14 +263,20 @@ class ParquetDataset(Dataset):
         else:
             file_idx = [bisect_right(self._chunk_cumsum, sequential_index)]
 
-        file_indices = [self._indices[idx] for idx in file_idx]
+        raw_file_indices = [self._indices[idx] for idx in file_idx]
+        file_indices: List[int] = []
+        for entry in raw_file_indices:
+            if isinstance(entry, list):
+                file_indices.extend(entry)
+            else:
+                file_indices.append(int(entry))
 
         arrays = []
-        for file_idx in file_indices:
+        for fidx in file_indices:
             array = self._query_table(
                 table=table,
                 columns=columns,
-                file_idx=file_idx,
+                file_idx=fidx,
                 sequential_index=sequential_index,
                 selection=selection,
             )

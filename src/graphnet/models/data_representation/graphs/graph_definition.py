@@ -1,8 +1,9 @@
 """Modules for defining graphs.
 
-These are self-contained graph definitions that hold all the graph-altering
-code in graphnet. These modules define what graph-based models sees as input
-and can be passed to dataloaders during training and deployment.
+These are self-contained graph definitions that hold all the graph-
+altering code in graphnet. These modules define what graph-based models
+sees as input and can be passed to dataloaders during training and
+deployment.
 """
 
 from typing import List, Optional, Dict, Union, Any, Callable
@@ -74,6 +75,9 @@ class GraphDefinition(DataRepresentation):
                 Defaults to False.
             add_static_features: If True, the original features will be
                 added as static attributes to the graph. Defaults to True.
+            add_token_count: If True, the number of nodes is stored as the
+                graph attribute `n_tokens` (e.g. for token-based bucketing
+                with `collator_compute_budget_bucketing`). Defaults to False.
         """
         # Base class constructor
         super().__init__(
@@ -167,6 +171,9 @@ class GraphDefinition(DataRepresentation):
         )
         # Create graph & get new node feature names
         data.x = self._node_definition(data.x)
+        # Event-level attributes computed by the node definition
+        for key, value in self._node_definition.graph_attributes.items():
+            data[key] = torch.tensor(value, dtype=torch.float64)
         if self._sort_by is not None:
             data.x = data.x[data.x[:, self._sort_by].sort()[1]]
 
@@ -182,10 +189,8 @@ class GraphDefinition(DataRepresentation):
                 data,
                 self.output_feature_names,
             )
-
         if self._add_token_count:
             data["n_tokens"] = len(data.x)
-
         return data
 
     def _add_features_individually(

@@ -2,8 +2,8 @@
 
 from collections import OrderedDict
 import os
-from typing import Dict, List, Optional, Tuple, Union, Callable
-
+from typing import Dict, List, Optional, Tuple, Union, Callable, Any
+import torch
 import numpy as np
 import pandas as pd
 from pytorch_lightning import Trainer
@@ -39,7 +39,6 @@ class collator_sequence_buckleting:
         last elements, which will always be 0 and 1 respectively.
         """
         self.batch_splits = batch_splits
-        self.parameter = "n_pulses"
 
     def __call__(self, graphs: List[Data]) -> Batch:
         """Execute sequence bucketing on the input list of graphs.
@@ -51,8 +50,8 @@ class collator_sequence_buckleting:
             A list of Batch objects, each containing a mini-batch of the input
             graphs sorted by their number of pulses.
         """
-        graphs = [g for g in graphs if getattr(g, self.parameter) > 1]
-        graphs.sort(key=lambda x: getattr(x, self.parameter))
+        graphs = [g for g in graphs if g.n_pulses > 1]
+        graphs.sort(key=lambda x: x.n_pulses)
         batch_list = []
 
         for minp, maxp in zip(
@@ -67,179 +66,62 @@ class collator_sequence_buckleting:
         return batch_list
 
 
-class collator_auto_bucket:
-    """Perform the sequence bucketing for the graphs in the batch."""
+class collator_compute_budget_bucketing:
+    """Pack graphs into mini-batches under a padded-compute budget.
 
-    def __init__(self, n_buckets: int = 3, parameter: str = "n_pulses"):
-        """Set number of buckets for the sequence bucketing."""
+    Graphs are sorted by sequence length (`parameter`) and packed greedily;
+    a new mini-batch is started whenever `n_graphs * max_length**gamma` of
+    the current one would exceed `max_compute`. This keeps the padded cost of
+    each mini-batch roughly constant (e.g. `gamma = 2` for attention), so a
+    batch is returned as a variable number of mini-batches.
 
-        self.n_buckets = n_buckets
-        self.parameter = parameter
-
-    def __call__(self, graphs: List[Data]) -> Batch:
-        """Execute sequence bucketing on the input list of graphs.
-
-        Args:
-            graphs: A list of Data objects representing the input graphs.
-
-        Returns:
-            A list of Batch objects, each containing a mini-batch of the input
-            graphs sorted by their number of pulses.
-        """
-        if len(graphs) == 0:
-            return []
-
-        # Sort once by sequence length and drop invalid events in the same pass.
-        valid_sorted = sorted(
-            (
-                (getattr(g, self.parameter), g)
-                for g in graphs
-                if getattr(g, self.parameter) > 1
-            ),
-            key=lambda x: x[0],
-        )
-
-        if len(valid_sorted) == 0:
-            return []
-
-        total_length = sum(length for length, _ in valid_sorted)
-        average_length = total_length / self.n_buckets
-
-        # Fill buckets towards equal total token mass while preventing empty tail buckets.
-        batch_list = []
-        current_bucket: List[Data] = []
-        current_length = 0
-
-        for idx, (length, graph) in enumerate(valid_sorted):
-            remaining_graphs = len(valid_sorted) - idx
-            remaining_bucket_slots = self.n_buckets - len(batch_list)
-
-            if (
-                current_bucket
-                and current_length + length > average_length
-                and len(batch_list) < self.n_buckets - 1
-                and remaining_graphs > remaining_bucket_slots
-            ):
-                batch_list.append(Batch.from_data_list(current_bucket))
-                current_bucket = []
-                current_length = 0
-
-            current_bucket.append(graph)
-            current_length += length
-
-        if current_bucket:
-            batch_list.append(Batch.from_data_list(current_bucket))
-
-        return batch_list
-
-
-class collator_auto_bucket_trans:
-    """Perform bucketing tuned for transformer padding cost.
-
-    The heuristic used here targets the approximate padded transformer cost
-    of a bucket, which scales roughly like ``B * L_max^2`` where ``B`` is the
-    number of graphs in the bucket and ``L_max`` is the longest sequence in
-    that bucket.
+    NOTE: Graphs with `parameter <= 1` (e.g. single-node events) are
+    dropped.
     """
 
-    def __init__(self, n_buckets: int = 3, parameter: str = "n_pulses"):
-        """Set number of buckets for the sequence bucketing."""
-
-        self.n_buckets = n_buckets
-        self.parameter = parameter
-
-    def __call__(self, graphs: List[Data]) -> Batch:
-        """Execute transformer-oriented bucketing on the input graphs.
+    def __init__(
+        self,
+        max_compute: float,
+        parameter: str = "n_pulses",
+        gamma: float = 2.0,
+        verbose: bool = False,
+        drop_slices: bool = False,
+    ):
+        """Construct `collator_compute_budget_bucketing`.
 
         Args:
-            graphs: A list of Data objects representing the input graphs.
-
-        Returns:
-            A list of Batch objects, each containing a mini-batch of the input
-            graphs sorted by sequence length and bucketed to better match the
-            quadratic transformer padding cost.
+            max_compute: Budget for `n_graphs * max_length**gamma` per
+                mini-batch. A single graph exceeding it forms its own batch.
+            parameter: Graph attribute holding the sequence length, e.g.
+                `n_pulses` or `n_tokens` (see
+                `GraphDefinition(add_token_count=True)`).
+            gamma: Exponent of the sequence length in the compute estimate.
+            verbose: If True, log the resulting mini-batches.
+            drop_slices: If True, the mini-batches do not keep the
+                bookkeeping needed to split them into graphs again
+                (`Batch.to_data_list`, indexing). It consists of two
+                tensors per attribute and mini-batch, i.e. about two thirds
+                of all tensors, each of which is a separate shared-memory
+                mapping when passed from a loader worker. With many small
+                mini-batches these can exhaust the mappings of a process
+                (`vm.max_map_count`: "unable to mmap ... Cannot allocate
+                memory").
         """
-        if len(graphs) == 0:
-            return []
-
-        valid_sorted = sorted(
-            (
-                (getattr(g, self.parameter), g)
-                for g in graphs
-                if getattr(g, self.parameter) > 1
-            ),
-            key=lambda x: x[0],
-        )
-
-        if len(valid_sorted) == 0:
-            return []
-
-        # Target approximate padded compute per bucket.
-        total_compute = sum(length * length for length, _ in valid_sorted)
-        target_compute = total_compute / self.n_buckets
-
-        batch_list: List[Batch] = []
-        current_bucket: List[Data] = []
-        current_max_length = 0
-
-        for idx, (length, graph) in enumerate(valid_sorted):
-            remaining_graphs = len(valid_sorted) - idx
-            remaining_bucket_slots = self.n_buckets - len(batch_list)
-
-            prospective_bucket_size = len(current_bucket) + 1
-            prospective_max_length = max(current_max_length, length)
-            prospective_cost = prospective_bucket_size * (
-                prospective_max_length * prospective_max_length
-            )
-
-            if (
-                current_bucket
-                and prospective_cost > target_compute
-                and len(batch_list) < self.n_buckets - 1
-                and remaining_graphs > remaining_bucket_slots
-            ):
-                batch_list.append(Batch.from_data_list(current_bucket))
-                current_bucket = []
-                current_max_length = 0
-
-            current_bucket.append(graph)
-            current_max_length = max(current_max_length, length)
-
-        if current_bucket:
-            batch_list.append(Batch.from_data_list(current_bucket))
-
-        return batch_list
-
-class collator_auto_bucket_trans_max_compute:
-    """Perform transformer-oriented bucketing under a compute budget.
-
-    Graphs are sorted by sequence length and then packed greedily until the
-    estimated padded compute in the current bucket would exceed the configured
-    maximum. This produces a variable number of microbatches per input batch.
-    """
-
-    def __init__(self, max_compute: float, parameter: str = "n_pulses", verbose: bool = False,gamma: float = 2.0):
-        """Set the maximum compute budget for each bucket."""
-
+        self.drop_slices = drop_slices
         self.max_compute = max_compute
         self.parameter = parameter
-        self.verbose = verbose
         self.gamma = gamma
+        self.verbose = verbose
 
-    def __call__(self, graphs: List[Data]) -> Batch:
-        """Execute compute-budget bucketing on the input graphs.
+    def __call__(self, graphs: List[Data]) -> List[Batch]:
+        """Pack `graphs` into mini-batches.
 
         Args:
             graphs: A list of Data objects representing the input graphs.
 
         Returns:
-            A list of Batch objects, each containing a mini-batch of the input
-            graphs packed so that the estimated compute stays below the
-            requested budget where possible.
+            A list of Batch objects, ordered by increasing sequence length.
         """
-        if len(graphs) == 0:
-            return []
-
         valid_sorted = sorted(
             (
                 (getattr(g, self.parameter), g)
@@ -249,38 +131,44 @@ class collator_auto_bucket_trans_max_compute:
             key=lambda x: x[0],
         )
 
-        if len(valid_sorted) == 0:
-            return []
-
         batch_list: List[Batch] = []
-        current_bucket: List[Data] = []
-        current_max_length = 0
-
+        bucket: List[Data] = []
+        bucket_max_length = 0
         for length, graph in valid_sorted:
-            prospective_size = len(current_bucket) + 1
-            prospective_max_length = max(current_max_length, length)
-            prospective_compute = prospective_size * prospective_max_length**self.gamma
-
-            if current_bucket and prospective_compute > self.max_compute:
-                batch_list.append(Batch.from_data_list(current_bucket))
-                current_bucket = []
-                current_max_length = 0
-
-            current_bucket.append(graph)
-            current_max_length = max(current_max_length, length)
-
-        if current_bucket:
-            batch_list.append(Batch.from_data_list(current_bucket))
+            max_length = max(bucket_max_length, length)
+            compute = (len(bucket) + 1) * max_length**self.gamma
+            if bucket and compute > self.max_compute:
+                batch_list.append(self._collate(bucket))
+                bucket, bucket_max_length = [], 0
+            bucket.append(graph)
+            bucket_max_length = max(bucket_max_length, length)
+        if bucket:
+            batch_list.append(self._collate(bucket))
 
         if self.verbose:
-            number_of_buckets = len(batch_list)
-            Logger().info(f"Number of buckets: {number_of_buckets}")
+            logger = Logger()
+            logger.info(f"Number of buckets: {len(batch_list)}")
             for i, batch in enumerate(batch_list):
-                batch_size = len(batch)
-                max_length = max(getattr(g, self.parameter) for g in batch.to_data_list())
-                estimated_compute = batch_size * (max_length * max_length)
-                Logger().info(f"Bucket {i}: size={batch_size}, max_length={max_length}, estimated_compute={estimated_compute}")
+                max_length = int(getattr(batch, self.parameter).max())
+                logger.info(
+                    f"Bucket {i}: size={batch.num_graphs}, "
+                    f"max_length={max_length}"
+                )
         return batch_list
+
+    def _collate(self, graphs: List[Data]) -> Batch:
+        """Collate `graphs` into one mini-batch.
+
+        The number of nodes of each graph is kept as a plain list in
+        `batch.node_counts`: unlike tensors it stays on the CPU when the
+        batch is moved to a GPU, so models can pad the nodes into sequences
+        without reading the counts back from the GPU (a synchronisation).
+        """
+        batch = Batch.from_data_list(graphs)
+        batch.node_counts = [int(graph.num_nodes) for graph in graphs]
+        if self.drop_slices:
+            batch._slice_dict, batch._inc_dict = {}, {}
+        return batch
 
 
 # @TODO: Remove in favour of DataLoader{,.from_dataset_config}
@@ -545,3 +433,77 @@ def save_selection(selection: List[int], file_path: str) -> None:
     with open(file_path, "w") as f:
         f.write(",".join(map(str, selection)))
         f.write("\n")
+
+
+def add_custom_labels(
+    data: Data,
+    custom_label_functions: Dict[str, Callable[..., Any]],
+    repeat_labels_by: Optional[int] = None,
+) -> Data:
+    """Add custom labels to the data.
+
+    Args:
+        data: data where the label will be stored
+        custom_label_functions: dictionary containing the custom
+            label functions
+        repeat_labels_by: If specified, repeats the labels along the
+            specified dimension.
+
+    Returns:
+        data with labels
+    """
+    # Add custom labels to the data
+    for key, fn in custom_label_functions.items():
+        try:
+            label = fn(data)
+        except KeyError as e:
+            raise KeyError(
+                f"Label '{key}' could not be computed because "
+                f"its required data field {e} is missing."
+            ) from e
+        if repeat_labels_by is not None:
+            label = label.repeat(data.x.shape[repeat_labels_by], 1)
+        data[key] = label
+    return data
+
+
+def add_truth(
+    data: Data,
+    truth_dicts: Union[Dict[str, Any], List[Dict[str, Any]]],
+    dtype: Optional[torch.dtype] = torch.float32,
+    repeat_labels_by: Optional[int] = None,
+) -> Data:
+    """Add truth labels from ´truth_dicts´ to ´data´.
+
+    I.e. ´data[key] = truth_dict[key]´
+
+
+    Args:
+        data: data where the label will be stored
+        truth_dicts: dictionary containing the labels
+        dtype: dtype of the truth labels
+        repeat_labels_by: If specified, repeats the labels along the
+            specified dimension.
+
+    Returns:
+        data with labels
+    """
+    # Write attributes, either target labels, truth info or original
+    # features.
+    if isinstance(truth_dicts, dict):
+        truth_dicts = [truth_dicts]
+    for truth_dict in truth_dicts:
+        for key, value in truth_dict.items():
+            try:
+                label = torch.tensor(value, dtype=dtype)
+                if repeat_labels_by is not None:
+                    label = label.repeat(data.x.shape[repeat_labels_by], 1)
+                data[key] = label
+            except TypeError:
+                # Cannot convert `value` to Tensor due to its data type,
+                # e.g. `str`.
+                raise TypeError(
+                    f"Could not assign `{key}` with type "
+                    f"'{type(value).__name__}' to data."
+                )
+    return data

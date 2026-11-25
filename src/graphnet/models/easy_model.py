@@ -1,7 +1,6 @@
 """Suggested Model subclass that enables simple user syntax."""
 
-from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Union, Type
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, Type
 
 import numpy as np
 import torch
@@ -11,22 +10,21 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch import Tensor
 from torch.nn import ModuleList
 from torch.optim import Adam
-from torch.utils.data import DataLoader, SequentialSampler
-from torch_geometric.data import Data, Batch
+from torch.utils.data import DataLoader
+from torch_geometric.data import Data
 import pandas as pd
 from pytorch_lightning.loggers import Logger as LightningLogger
 
 from graphnet.training.callbacks import ProgressBar
 from graphnet.models.model import Model
 from graphnet.models.task import StandardLearnedTask
-from graphnet.models.task.multitask_utils import LossWeightBalancing
 
 
 class EasySyntax(Model):
     """A suggested Model class that comes with simple user syntax.
 
-    This class delivers simple user syntax for training and prediction, while
-    imposing minimal constraints on structure.
+    This class delivers simple user syntax for training and prediction,
+    while imposing minimal constraints on structure.
     """
 
     def __init__(
@@ -38,9 +36,25 @@ class EasySyntax(Model):
         scheduler_class: Optional[type] = None,
         scheduler_kwargs: Optional[Dict] = None,
         scheduler_config: Optional[Dict] = None,
-        additional_attributes: Optional[List[str]] = None,
+        log_on_epoch: bool = True,
+        log_on_step: bool = False,
     ) -> None:
-        """Construct `StandardModel`."""
+        """Construct `StandardModel`.
+
+        Args:
+            tasks: Task(s) appended as the head(s) of the model, defining
+                the prediction target(s) and loss(es).
+            optimizer_class: Optimizer class used during training.
+            optimizer_kwargs: Keyword arguments passed to `optimizer_class`.
+            scheduler_class: Learning-rate scheduler class. If `None`, no
+                scheduler is used.
+            scheduler_kwargs: Keyword arguments passed to `scheduler_class`.
+            scheduler_config: Additional configuration for how the scheduler
+                is invoked by PyTorch Lightning (e.g. `interval`, `frequency`).
+            log_on_epoch: If `True`, logs the training loss on epoch end.
+            log_on_step: If `True`, logs the training loss on step end.
+                per-batch training loss under `train_loss_step`.
+        """
         # Base class constructor
         super().__init__(name=__name__, class_name=self.__class__.__name__)
 
@@ -55,7 +69,9 @@ class EasySyntax(Model):
         self._scheduler_class = scheduler_class
         self._scheduler_kwargs = scheduler_kwargs or dict()
         self._scheduler_config = scheduler_config or dict()
-        self._additional_attributes = additional_attributes or []
+        self._predict_attributes: List[str] = []
+        self._log_on_step = log_on_step
+        self._log_on_epoch = log_on_epoch
 
         self.validate_tasks()
 
@@ -71,13 +87,11 @@ class EasySyntax(Model):
         """Forward pass, chaining model components."""
         raise NotImplementedError
 
-    def shared_step(
-        self, batch: List[Data], batch_idx: int
-    ) -> tuple[Tensor, Tensor]:
+    def shared_step(self, batch: List[Data], batch_idx: int) -> Tensor:
         """Perform shared step.
 
-        Applies the forward pass and the following loss calculation, shared
-        between the training and validation step.
+        Applies the forward pass and the following loss calculation,
+        shared between the training and validation step.
         """
         raise NotImplementedError
 
@@ -185,7 +199,9 @@ class EasySyntax(Model):
                 if isinstance(callback, ModelCheckpoint):
                     checkpoint_callback = callback
             self.load_state_dict(
-                torch.load(checkpoint_callback.best_model_path)["state_dict"]
+                torch.load(
+                    checkpoint_callback.best_model_path, weights_only=False
+                )["state_dict"]
             )
             self.info("Best-fit weights from EarlyStopping loaded.")
 
@@ -218,26 +234,21 @@ class EasySyntax(Model):
             label for task in self._tasks for label in task._prediction_labels
         ]
 
+    def _optimizer_parameters(self) -> Union[Iterator, List[Dict]]:
+        """Return the parameters (or parameter groups) to optimize."""
+        return self.parameters()
+
     def configure_optimizers(self) -> Dict[str, Any]:
-        """Configure the model's optimizer(s)."""
-        if hasattr(self, "loss_weight_balancing"):
-            self.info("Using Loss Weight Balancing for multi-task learning.")
-            # seperate the parameters of the loss weight balancing from the rest
-            loss_weight_params = list(self.loss_weight_balancing.noise_params)
-            other_params = list(
-                set(self.parameters()) - set(loss_weight_params)
-            )
-            param_groups = [
-                {"params": other_params, **self._optimizer_kwargs},
-                {"params": loss_weight_params, **self._optimizer_kwargs},
-            ]
-            # scale the lr down by two orders of magnitude for the loss weight balancing parameters
-            param_groups[-1]["lr"] = param_groups[-1].get("lr", 0.001) * 1e-2
-            optimizer = self._optimizer_class(param_groups)
-        else:
-            optimizer = self._optimizer_class(
-                self.parameters(), **self._optimizer_kwargs
-            )
+        """Configure the model's optimizer(s).
+
+        Parameter groups may carry an `lr_scale`: their learning rate is
+        the (scheduled) learning rate times this factor.
+        """
+        optimizer = self._optimizer_class(
+            self._optimizer_parameters(), **self._optimizer_kwargs
+        )
+        for group in optimizer.param_groups:
+            group.setdefault("lr_scale", 1.0)
         config = {
             "optimizer": optimizer,
         }
@@ -253,7 +264,26 @@ class EasySyntax(Model):
                     },
                 }
             )
+        # Applied after the scheduler set its initial learning rates
+        _apply_lr_scale(optimizer, inverse=False)
         return config
+
+    def lr_scheduler_step(self, scheduler: Any, metric: Any) -> None:
+        """Step the scheduler, keeping each parameter group's `lr_scale`.
+
+        The scale is removed before the step, so that schedulers setting
+        (or multiplying) learning rates see their own values, and
+        applied again afterwards.
+        """
+        optimizer = getattr(scheduler, "optimizer", None)
+        if optimizer is not None:
+            _apply_lr_scale(optimizer, inverse=True)
+        if metric is None:
+            scheduler.step()
+        else:
+            scheduler.step(metric)
+        if optimizer is not None:
+            _apply_lr_scale(optimizer, inverse=False)
 
     def training_step(
         self, train_batch: Union[Data, List[Data]], batch_idx: int
@@ -261,68 +291,42 @@ class EasySyntax(Model):
         """Perform training step."""
         if isinstance(train_batch, Data):
             train_batch = [train_batch]
-        loss, loss_stack = self.shared_step(train_batch, batch_idx)
+        loss = self.shared_step(train_batch, batch_idx)
         self.log(
             "train_loss",
             loss,
             batch_size=self._get_batch_size(train_batch),
             prog_bar=True,
-            on_epoch=True,
-            on_step=False,
+            on_epoch=self._log_on_epoch,
+            on_step=self._log_on_step,
             sync_dist=True,
         )
+
         current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-        self.log("lr", current_lr, prog_bar=True, on_step=True)
+        # Not in the progress bar: progress-bar values are read back from the
+        # GPU after every batch, a synchronisation that stops the CPU from
+        # preparing the next step while the GPU works. Logged values are
+        # read back only every `log_every_n_steps`.
+        self.log("lr", current_lr, prog_bar=False, on_step=True)
         return loss
 
     def validation_step(
         self, val_batch: Union[Data, List[Data]], batch_idx: int
     ) -> Tensor:
         """Perform validation step."""
-        with torch.no_grad():
-            if isinstance(val_batch, Data):
-                val_batch = [val_batch]
-            loss, loss_stack = self.shared_step(val_batch, batch_idx)
-            self.log(
-                "val_loss",
-                loss,
-                batch_size=self._get_batch_size(val_batch),
-                prog_bar=True,
-                on_epoch=True,
-                on_step=False,
-                sync_dist=True,
-            )
+        if isinstance(val_batch, Data):
+            val_batch = [val_batch]
+        loss = self.shared_step(val_batch, batch_idx)
+        self.log(
+            "val_loss",
+            loss,
+            batch_size=self._get_batch_size(val_batch),
+            prog_bar=True,
+            on_epoch=self._log_on_epoch,
+            on_step=self._log_on_step,
+            sync_dist=True,
+        )
         return loss
-
-    def predict_step(
-        self, batch, batch_idx, dataloader_idx=0
-    ) -> Dict[str, Tensor]:
-        return_dict = {}
-        with torch.no_grad():  # redundant with self.inference()?
-            if isinstance(batch, Data):
-                batch = [batch]
-            preds = self.forward(batch)
-            for pred, task in zip(preds, self._tasks):
-                names = task._prediction_labels
-                for i, name in enumerate(names):
-                    return_dict[name] = pred[:, i].detach().cpu()
-
-        if len(self._additional_attributes) > 0:
-            for attr in self._additional_attributes:
-                attr_temp = []
-                for b in batch:
-                    attribute = b[attr]
-                    if not isinstance(attribute, torch.Tensor):
-                        attribute = torch.as_tensor(attribute)
-                    attribute = attribute.detach().cpu()
-                    if attribute.dim() == 0:
-                        attribute = attribute.unsqueeze(0)
-                    attr_temp.append(attribute)
-
-                attribute = torch.cat(attr_temp, dim=0)
-                return_dict[attr] = attribute
-
-        return return_dict
 
     def inference(self) -> None:
         """Activate inference mode."""
@@ -337,21 +341,55 @@ class EasySyntax(Model):
                 task.train_eval()
         return self
 
-    def predict(
+    def predict_step(
+        self,
+        batch: Union[Data, List[Data]],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> Tuple[List[Tensor], Dict[str, Tensor]]:
+        """Return predictions and requested attributes for `batch`.
+
+        The attributes listed in `_predict_attributes` are read from the same
+        batch as the predictions, so they stay aligned with them regardless
+        of sampling, shuffling or events dropped by the `collate_fn`.
+        Event-level attributes are repeated per node for node-level
+        predictions.
+        """
+        batches = [batch] if isinstance(batch, Data) else list(batch)
+        predictions = self(batches)
+
+        n_rows = int(predictions[0].shape[0]) if len(predictions) else 0
+        n_nodes = sum(int(b.num_nodes) for b in batches)
+        n_events = sum(int(b.num_graphs) for b in batches)
+        node_level = n_rows == n_nodes and n_nodes != n_events
+
+        attributes: Dict[str, Tensor] = {}
+        for attr in self._predict_attributes:
+            values = []
+            for b in batches:
+                value = torch.as_tensor(b[attr]).detach().cpu().reshape(-1)
+                if node_level and len(value) == b.num_graphs:
+                    counts = torch.bincount(b.batch, minlength=b.num_graphs)
+                    value = value.repeat_interleave(counts.cpu())
+                values.append(value)
+            attributes[attr] = torch.cat(values)
+        return predictions, attributes
+
+    def _predict(
         self,
         dataloader: DataLoader,
-        gpus: Optional[Union[List[int], int]] = None,
-        distribution_strategy: Optional[str] = "auto",
+        additional_attributes: List[str],
+        gpus: Optional[Union[List[int], int]],
+        distribution_strategy: Optional[str],
         **trainer_kwargs: Any,
-    ) -> Dict[str, np.ndarray]:
-        """Return predictions for `dataloader`."""
+    ) -> Tuple[List[np.ndarray], Dict[str, np.ndarray]]:
+        """Run inference and gather predictions and attributes."""
         self.inference()
         self.train(mode=False)
 
         callbacks = self._create_default_callbacks(
             val_dataloader=None,
         )
-
         inference_trainer = self._construct_trainer(
             gpus=gpus,
             distribution_strategy=distribution_strategy,
@@ -359,57 +397,69 @@ class EasySyntax(Model):
             **trainer_kwargs,
         )
 
-        outputs = inference_trainer.predict(self, dataloader)
-        local_outputs: Dict[str, np.ndarray]
-        if len(outputs) == 0:
-            local_outputs = {}
-        else:
-            local_outputs = {
-                key: torch.cat([out[key] for out in outputs], dim=0)
+        self._predict_attributes = list(additional_attributes)
+        try:
+            outputs = inference_trainer.predict(self, dataloader) or []
+        finally:
+            self._predict_attributes = []
+
+        predictions: List[np.ndarray] = []
+        attributes: Dict[str, np.ndarray] = {}
+        if len(outputs) > 0:
+            nb_outputs = len(outputs[0][0])
+            predictions = [
+                torch.cat([out[0][ix] for out in outputs], dim=0)
+                .detach()
+                .cpu()
                 .numpy()
-                .flatten()
-                for key in outputs[0].keys()
-            }
-
-        # In distributed prediction each rank holds only a shard; gather all shards.
-        if dist.is_available() and dist.is_initialized():
-            gathered_outputs: List[Dict[str, np.ndarray]] = [
-                {} for _ in range(dist.get_world_size())
+                for ix in range(nb_outputs)
             ]
-            dist.all_gather_object(gathered_outputs, local_outputs)
-
-            all_keys = sorted(
-                {
-                    key
-                    for rank_outputs in gathered_outputs
-                    for key in rank_outputs.keys()
-                }
-            )
-            outputs = {
-                key: np.concatenate(
-                    [
-                        rank_outputs[key]
-                        for rank_outputs in gathered_outputs
-                        if key in rank_outputs
-                    ],
-                    axis=0,
-                )
-                for key in all_keys
+            attributes = {
+                attr: torch.cat([out[1][attr] for out in outputs]).numpy()
+                for attr in additional_attributes
             }
-        else:
-            outputs = local_outputs
 
-        if len(outputs) == 0:
-            raise ValueError("Got no predictions")
+        # In distributed inference each rank only holds its own shard.
+        if dist.is_available() and dist.is_initialized():
+            shards: List[Any] = [None] * dist.get_world_size()
+            dist.all_gather_object(shards, (predictions, attributes))
+            shards = [shard for shard in shards if len(shard[0]) > 0]
+            if len(shards) > 0:
+                predictions = [
+                    np.concatenate([shard[0][ix] for shard in shards])
+                    for ix in range(len(shards[0][0]))
+                ]
+                attributes = {
+                    attr: np.concatenate([shard[1][attr] for shard in shards])
+                    for attr in additional_attributes
+                }
 
-        return outputs
+        assert len(predictions), "Got no predictions"
+        return predictions, attributes
+
+    def predict(
+        self,
+        dataloader: DataLoader,
+        gpus: Optional[Union[List[int], int]] = None,
+        distribution_strategy: Optional[str] = "auto",
+        **trainer_kwargs: Any,
+    ) -> List[Tensor]:
+        """Return predictions for `dataloader`, one tensor per task."""
+        predictions, _ = self._predict(
+            dataloader,
+            additional_attributes=[],
+            gpus=gpus,
+            distribution_strategy=distribution_strategy,
+            **trainer_kwargs,
+        )
+        return [torch.from_numpy(pred) for pred in predictions]
 
     def predict_as_dataframe(
         self,
         dataloader: DataLoader,
         prediction_columns: Optional[List[str]] = None,
         *,
-        # additional_attributes: Optional[List[str]] = None,
+        additional_attributes: Optional[List[str]] = None,
         gpus: Optional[Union[List[int], int]] = None,
         distribution_strategy: Optional[str] = "auto",
         **trainer_kwargs: Any,
@@ -417,24 +467,41 @@ class EasySyntax(Model):
         """Return predictions for `dataloader` as a DataFrame.
 
         Include `additional_attributes` as additional columns in the output
-        DataFrame.
+        DataFrame. The attributes are collected together with the
+        predictions, so any sampler, `collate_fn` or distributed strategy
+        may be used.
         """
         if prediction_columns is None:
             prediction_columns = self.prediction_labels
+        additional_attributes = list(additional_attributes or [])
 
         self.info(f"Column names for predictions are: \n {prediction_columns}")
-        self.warning_once(
-            "DEPRECATION WARNING 2.0: predict_as_dataframe will be deprecated as it has just become a simple wrapper around predict. Please use predict instead and convert the output to a DataFrame yourself."
-        )
-        predictions_torch = self.predict(
-            dataloader=dataloader,
+        predictions_list, attributes = self._predict(
+            dataloader,
+            additional_attributes=additional_attributes,
             gpus=gpus,
             distribution_strategy=distribution_strategy,
             **trainer_kwargs,
         )
+        predictions = np.concatenate(
+            [pred.reshape(len(pred), -1) for pred in predictions_list], axis=1
+        )
+        assert len(prediction_columns) == predictions.shape[1], (
+            f"Number of provided column names ({len(prediction_columns)}) and "
+            f"number of output columns ({predictions.shape[1]}) don't match."
+        )
 
-        results = pd.DataFrame.from_dict(predictions_torch)
-
+        results = pd.DataFrame(predictions, columns=prediction_columns)
+        for attr, values in attributes.items():
+            if len(values) != len(results):
+                self.warning_once(
+                    f"Length of additional attribute '{attr}' ({len(values)})"
+                    f" does not match the predictions ({len(results)}), e.g."
+                    " because pulse-level attributes were requested for"
+                    " event-level predictions. Attribute skipped."
+                )
+                continue
+            results[attr] = values
         return results
 
     def _create_default_callbacks(
@@ -444,7 +511,8 @@ class EasySyntax(Model):
     ) -> List:
         """Create default callbacks.
 
-        Used in cases where no callbacks are specified by the user in .fit
+        Used in cases where no callbacks are specified by the user in
+        .fit
         """
         callbacks = [ProgressBar()]
         if val_dataloader is not None:
@@ -496,3 +564,13 @@ class EasySyntax(Model):
                 "patience=5 and monitor = 'val_loss'."
             )
         return callbacks
+
+
+def _apply_lr_scale(optimizer: torch.optim.Optimizer, inverse: bool) -> None:
+    """Multiply (or divide) each group's learning rate by its `lr_scale`."""
+    for group in optimizer.param_groups:
+        scale = group.get("lr_scale", 1.0)
+        if scale != 1.0:
+            group["lr"] = (
+                group["lr"] / scale if inverse else group["lr"] * scale
+            )

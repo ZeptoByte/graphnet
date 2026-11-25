@@ -34,8 +34,8 @@ class Deployer(ABC, Logger):
     ) -> None:
         """Process a single file.
 
-        If n_workers > 1, this function is run in parallel n_worker times. Each
-        worker will loop over an allocated set of files.
+        If n_workers > 1, this function is run in parallel n_worker
+        times. Each worker will loop over an allocated set of files.
         """
         raise NotImplementedError
 
@@ -45,8 +45,8 @@ class Deployer(ABC, Logger):
     ) -> List[Any]:
         """Produce a list of inputs for each worker.
 
-        This function must produce and return a list of arguments to each
-        worker.
+        This function must produce and return a list of arguments to
+        each worker.
         """
         raise NotImplementedError
 
@@ -154,12 +154,8 @@ class Deployer(ABC, Logger):
             len(settings) == self._n_workers
         ), f"Number of settings must match number of workers but got {len(settings)} and {self._n_workers}"
 
-        self.info(
-            f"""processing {len(input_files)} files \n
-                using {self._n_workers} workers"""
-        )
+        self.info(f"""processing {len(input_files)} files \n
+                using {self._n_workers} workers""")
         self._launch_jobs(settings)
-        self.info(
-            f"""Processing {len(input_files)} files was completed in \n
-         {time.time() - start_time} seconds using {self._n_workers} cores."""
-        )
+        self.info(f"""Processing {len(input_files)} files was completed in \n
+         {time.time() - start_time} seconds using {self._n_workers} cores.""")

@@ -3,378 +3,389 @@
 Contains functionality for writing model predictions to i3 files.
 """
 
-from typing import List, Union, Optional, TYPE_CHECKING, Dict, Any
-import numpy as np
-from torch_geometric.data import Data, Batch
-from torch.cuda import OutOfMemoryError
-from time import sleep, perf_counter
-import torch
-import gc
-import os
+from dataclasses import dataclass
+from time import perf_counter
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TYPE_CHECKING,
+    Union,
+)
 
+import numpy as np
+import torch
+from torch_geometric.data import Data, Batch
 
 from graphnet.utilities.config import ModelConfig
 from graphnet.deployment import DeploymentModule
-from graphnet.data.extractors.icecube import I3PulseExtractor
+from graphnet.deployment.deployment_module import (
+    add_time_references,
+    concatenate_task_outputs,
+)
+from graphnet.data.extractors.icecube import I3FeatureExtractor
+from graphnet.models import Model
 from graphnet.utilities.imports import has_icecube_package
 
 if has_icecube_package() or TYPE_CHECKING:
     from icecube.icetray import (
         I3Frame,
     )  # pyright: reportMissingImports=false
-    from icecube import (
-        dataclasses,
-    )
     from icecube.dataclasses import (
-        I3Double,
-        I3Particle,
         I3Direction,
+        I3Double,
+        I3MapStringDouble,
+        I3Particle,
         I3Position,
     )  # pyright: reportMissingImports=false
 
 
+@dataclass
+class _DeployedModel:
+    """One model of an `I3InferenceModule` and how its output is written."""
+
+    name: str
+    model: Model
+    features: List[str]
+    columns: List[str]
+    reference_times: Dict[str, str]
+
+
+@dataclass
+class _ModelOutput:
+    """The output of one model for one frame."""
+
+    name: str
+    values: Dict[str, float]  # prediction column -> value
+    references: Dict[str, float]  # reference attribute -> value
+    has_pulses: bool
+
+
+def _model_references(model: Model) -> Dict[str, str]:
+    """Return prediction label -> reference attribute declared by the tasks.
+
+    These are added back by the model itself (`Task(reference_labels=...)`).
+    """
+    references = {}
+    for task in getattr(model, "_tasks", []):
+        for column, attribute in getattr(task, "_reference_columns", []):
+            references[task._prediction_labels[column]] = attribute
+    return references
+
+
 class I3InferenceModule(DeploymentModule):
-    """General class for inference on i3 frames."""
+    """General class for inference on i3 frames.
+
+    Every task of a model is written, each prediction column as an
+    `I3Double` named `<model_name>_<column>`. Several models can be run in
+    one module (lists of `model_config`, `state_dict` and `model_name`):
+    the pulses are extracted once per frame, and each model builds its own
+    data representation from them.
+
+    Time predictions relative to an event-level reference are written as
+    absolute times: either the model adds the reference itself (tasks with
+    `reference_labels`), or `reference_times` names the graph attribute to
+    add. The references used are also written, as `<model_name>_<attribute>`.
+    """
 
     def __init__(
         self,
-        pulsemap_extractor: Union[List[I3PulseExtractor], I3PulseExtractor],
-        model_config: Union[List[ModelConfig], List[str], ModelConfig, str],
-        state_dict: Union[List[str], str],
-        model_name: Union[List[str], str],
-        num_threads: int = 1,
-        gcd_file: Optional[str] = None,
+        pulsemap_extractor: Union[
+            List[I3FeatureExtractor], I3FeatureExtractor
+        ],
+        model_config: Union[
+            ModelConfig, str, Sequence[Union[ModelConfig, str]]
+        ],
+        state_dict: Union[str, Sequence[str]],
+        model_name: Union[str, List[str]],
+        gcd_file: str,
         features: Optional[List[str]] = None,
-        prediction_columns: Optional[Union[List[str], None]] = None,
+        prediction_columns: Optional[
+            Union[Sequence[str], Sequence[Optional[Sequence[str]]]]
+        ] = None,
         pulsemap: Optional[str] = None,
-        multiple_models: bool = False,
-        requirements: Optional[callable] = None,
-        device: Optional[str] = "cpu",
-        batch_size: Optional[int] = 1,
-        skip: bool = False,
-        inference_speed_check: bool = False,
-        overwrite: bool = True,
+        reference_times: Optional[
+            Union[Dict[str, str], List[Optional[Dict[str, str]]]]
+        ] = None,
+        device: str = "cpu",
+        overwrite: bool = False,
+        requirements: Optional[Callable[["I3Frame"], bool]] = None,
+        record_runtimes: bool = False,
+        num_threads: Optional[int] = None,
+        inference_speed_check: Optional[bool] = None,
     ):
         """General class for inference on I3Frames (physics).
 
         Arguments:
             pulsemap_extractor: The extractor used to extract the pulsemap.
             model_config: The ModelConfig (or path to it) that summarizes the
-                            model used for inference.
-
-            state_dict: Path to state_dict containing the learned weights.
+                            model used for inference; a list for several
+                            models.
+            state_dict: Path to state_dict containing the learned weights
+                (or a Lightning `.ckpt`); a list for several models.
             model_name: The name used for the model. Will help define the
-                        named entry in the I3Frame. E.g. "dynedge".
+                        named entry in the I3Frame. E.g. "dynedge". A list
+                        (one name per model) for several models.
             gcd_file: path to associated gcd file.
-            features: the features of the pulsemap that the model is expecting.
-            prediction_columns: column names for the predictions of the model.
-                               Will help define the named entry in the I3Frame.
-                                E.g. ['energy_reco']. Optional.
+            features: the features of the pulsemap that the models are
+                expecting. Defaults to each model's input feature names.
+            prediction_columns: column names for the predictions of the model
+                (all tasks, in task order). Will help define the named entry
+                in the I3Frame. E.g. ['energy_reco']. Optional; for several
+                models a list with one entry (or None) per model.
             pulsemap: the pulsmap that the model is expecting as input.
-            multiple_models: process multiple models with the same feature set at once.
+            reference_times: Prediction columns whose values are relative to
+                an event-level time reference, mapped to the graph attribute
+                that holds the reference, e.g. `{"HEPTime": "reference_time"}`
+                for a time target relative to the `reference_time_attribute`
+                of `ClusterSummaryFeatures`. The reference is added back, so
+                these columns are written as absolute times, and the
+                reference itself is written as `<model_name>_<attribute>`.
+                Only for models that do not add the reference themselves
+                (tasks with `reference_labels`). For several models, a list
+                with one entry (or None) per model.
+            device: The computational device to run the models on.
+            overwrite: If True, replace frame objects that already exist
+                under the same key; otherwise keep them (with a warning).
+            requirements: Optional function of the frame; frames for which it
+                returns False are passed on without inference.
+            record_runtimes: If True, write the time spent per frame on data
+                representation, inference and writing (and their total) as an
+                `I3MapStringDouble` named `<first model_name>_Speed`.
+            num_threads: If given, `torch.set_num_threads(num_threads)` is
+                called before each frame's inference (other modules in the
+                tray may change the number of threads).
+            inference_speed_check: Deprecated name of `record_runtimes`.
         """
         super().__init__(
             model_config=model_config,
             state_dict=state_dict,
             prediction_columns=prediction_columns,
             device=device,
-            multiple_models=multiple_models,
         )
+        if inference_speed_check is not None:
+            self.warning(
+                "`inference_speed_check` is deprecated; use "
+                "`record_runtimes`."
+            )
+            record_runtimes = record_runtimes or inference_speed_check
         # Checks
-        if gcd_file is not None:
-            assert isinstance(gcd_file, str), "gcd_file must be string"
+        assert isinstance(gcd_file, str), "gcd_file must be string"
+        names = model_name if isinstance(model_name, list) else [model_name]
+        assert len(names) == len(self.models), "Give one model_name per model."
+        assert len(set(names)) == len(names), "model names must be unique."
+        if reference_times is None or isinstance(reference_times, dict):
+            references_per_model = [reference_times] * len(self.models)
         else:
-            self.warning("No GCD file provided. " "Expected to be set later")
+            references_per_model = list(reference_times)
+        assert len(references_per_model) == len(
+            self.models
+        ), "Give one reference_times entry (or None) per model."
 
         # Set Member Variables
         if isinstance(pulsemap_extractor, list):
             self._i3_extractors = pulsemap_extractor
         else:
             self._i3_extractors = [pulsemap_extractor]
-
-        # All
-        if self.multiple_models == True:
-            self.features_list = []
-            for model in self.models:
-                self.features_list.append(
-                    model._graph_definition._input_feature_names
-                )
-        elif features is None:
-            features = self.model._graph_definition._input_feature_names
-
-        if self.multiple_models == True:
-            self._graph_definitions = [
-                model._graph_definition for model in self.models
-            ]
-            self._graph_definitions = [
-                graph_definition.to(device)
-                for graph_definition in self._graph_definitions
-            ]
-        else:
-            self._graph_definition = self.model._graph_definition
-            self._graph_definition.to(device)
-
+        self._deployed = [
+            self._deploy(name, model, columns, features, references)
+            for name, model, columns, references in zip(
+                names,
+                self.models,
+                self.prediction_columns_per_model,
+                references_per_model,
+            )
+        ]
+        self.model_name = model_name
+        self._graph_definition = self.model._graph_definition
+        self._features = self._deployed[0].features
         self._pulsemap = pulsemap
         self._gcd_file = gcd_file
-        self.model_name = model_name
-        self._features = features
-        self._requirements = requirements
-        self._device = device
-        self._batch_size = batch_size
-        self._skip = skip
-        self._num_threads = num_threads
-        self._inference_speed_check = inference_speed_check
-        self._multiple_models = multiple_models
         self._overwrite = overwrite
+        self._requirements = requirements
+        self._record_runtimes = record_runtimes
+        self._num_threads = num_threads
+
         # Set GCD file for pulsemap extractor
-        if gcd_file is not None:
-            for i3_extractor in self._i3_extractors:
-                i3_extractor.set_gcd(i3_file="", gcd_file=self._gcd_file)
+        for i3_extractor in self._i3_extractors:
+            i3_extractor.set_gcd(i3_file="", gcd_file=self._gcd_file)
+
+    def _deploy(
+        self,
+        name: str,
+        model: Model,
+        columns: List[str],
+        features: Optional[List[str]],
+        reference_times: Optional[Dict[str, str]],
+    ) -> _DeployedModel:
+        """Check how a model's output is written, and describe it."""
+        reference_times = dict(reference_times or {})
+        unknown = set(reference_times) - set(columns)
+        assert not unknown, f"reference_times: unknown columns {unknown}"
+        added_by_model = _model_references(model)
+        twice = set(reference_times) & set(added_by_model)
+        if twice:
+            raise ValueError(
+                f"{name}: the model already adds the references of {twice} "
+                "(reference_labels); `reference_times` would add them twice."
+            )
+        node_reference = getattr(
+            model._graph_definition._node_definition,
+            "_reference_time_attribute",
+            None,
+        )
+        used = set(reference_times.values()) | set(added_by_model.values())
+        if node_reference is not None and node_reference not in used:
+            self.warning(
+                f"{name}: the node definition adds the time reference "
+                f"'{node_reference}' to each graph, but neither the model "
+                "(reference_labels) nor `reference_times` uses it: time "
+                "predictions relative to it are written as relative times."
+            )
+        if features is None:
+            features = model._graph_definition._input_feature_names
+        # references added by the model are written too (traceability)
+        return _DeployedModel(
+            name=name,
+            model=model,
+            features=list(features),
+            columns=list(columns),
+            reference_times=reference_times,
+        )
 
     def __call__(self, frame: I3Frame) -> bool:
-        """Write predictions from model to frame."""
-        # Check requirements
-        torch.set_num_threads(self._num_threads)
-        if not self._requirements is None:
-            if not self._check_requirements(frame=frame):
-                if self._skip:
-                    return False
-                predictions = np.repeat(
-                    [np.nan], len(self.prediction_columns)
-                ).reshape(-1, len(self.prediction_columns))
-                dim = self._check_dimensions(predictions=predictions)
-                data = self._create_dictionary(
-                    dim=dim, predictions=predictions
+        """Write predictions from model(s) to frame."""
+        if self._requirements is not None and not self._requirements(frame):
+            return True
+        if self._num_threads is not None:
+            torch.set_num_threads(self._num_threads)
+        start = perf_counter()
+        # Extract the pulses once for all models
+        feature_dicts = [extractor(frame) for extractor in self._i3_extractors]
+        graphs = [
+            self._create_graph(feature_dicts, deployed)
+            for deployed in self._deployed
+        ]
+        represented = perf_counter()
+
+        # Inference; relative times -> absolute times
+        outputs = []
+        for deployed, data in zip(self._deployed, graphs):
+            predictions = self._apply_model(data=data, deployed=deployed)
+            predictions, references = add_time_references(
+                predictions, data, deployed.columns, deployed.reference_times
+            )
+            for column, attribute in _model_references(deployed.model).items():
+                if column in deployed.columns:
+                    references[attribute] = (
+                        float(data[attribute].reshape(-1)[0])
+                        if data is not None
+                        else float("nan")
+                    )
+            outputs.append(
+                _ModelOutput(
+                    name=deployed.name,
+                    values=dict(zip(deployed.columns, predictions[0])),
+                    references=references,
+                    has_pulses=data is not None,
                 )
-                self._add_to_frame(frame=frame, data=data)
-                return True
-        # inference
-        memory_watch = False
-        try:
-            predictions, data_repr_time, inference_time = (
-                self._create_data_and_apply(frame=frame)
             )
+        inferred = perf_counter()
 
-        except OutOfMemoryError:
-            self.error(
-                "Out of memory error. "
-                "Please reduce batch size or model size."
-                "trying to run on cpu."
+        # Submit to frame
+        self._write(frame=frame, outputs=outputs)
+        written = perf_counter()
+        if self._record_runtimes:
+            self._put(
+                frame,
+                self._runtimes_key(),
+                I3MapStringDouble(
+                    {
+                        "data_repr_time": represented - start,
+                        "inference_time": inferred - represented,
+                        "write_time": written - inferred,
+                        "total_time": written - start,
+                    }
+                ),
             )
-            save_device = self._device
-            self._device = "cpu"
-            self.model.to(self._device)
-
-            predictions, data_repr_time, inference_time = (
-                self._create_data_and_apply(frame=frame)
-            )
-            memory_watch = True
-            self._device = save_device
-
-        if self._inference_speed_check is True:
-            write_start = perf_counter()
-        # Check dimensions of predictions and prediction columns
-        dim = self._check_dimensions(predictions=predictions)
-
-        # Build Dictionary from predictions
-        data = self._create_dictionary(dim=dim, predictions=predictions)
-        del predictions
-        del dim
-
-        # Submit Dictionary to frame
-        self._add_to_frame(frame=frame, data=data)
-        del data
-        if self._inference_speed_check is True:
-            write_end = perf_counter()
-            write_time = write_end - write_start
-            #self._logger.info(f"Write time: {write_time:.4f} s\n")
-            total_time = data_repr_time + inference_time + write_time
-            #self._logger.info(f"Total time: {total_time:.4f} s\n")
-            dict_speed = {
-                "data_repr_time": data_repr_time,
-                "inference_time": inference_time,
-                "write_time": write_time,
-                "total_time": total_time,
-            }
-
-            self._add_runtimes_to_frame(frame=frame, runtimes=dict_speed)
-
-        self._clean_device()
-
-        if memory_watch:
-            self.warning("Memory watch triggered. Trying to return to device.")
-            self.model.to(self._device)
         return True
 
-    def _create_data_and_apply(self, frame: I3Frame) -> tuple:
-        data_repr_time = -1
-        inference_time = -1
-        if self._inference_speed_check is True:
-            # create log file if it does not exist
-            data_repr_start = perf_counter()
-        if not self.multiple_models:
-            data = self._create_data_representation(frame=frame).to(
-                self._device
-            )
-            if self._inference_speed_check is True:
-                data_repr_end = perf_counter()
-                data_repr_time = data_repr_end - data_repr_start
-                inference_start = perf_counter()
-            predictions = self._apply_model(data=data)
-        else:
-            features = self._extract_feature_array_from_frame(frame=frame)
-            if self._inference_speed_check is True:
-                data_repr_end = perf_counter()
-                data_repr_time = data_repr_end - data_repr_start
-                inference_start = perf_counter()
-            model_input_data = []
-            for _, graph_definition in enumerate(self._graph_definitions):
-                data = graph_definition(
-                    input_features=features[_],
-                    input_feature_names=self.features_list[_],
+    def _runtimes_key(self) -> str:
+        return self._deployed[0].name + "_Speed"
+
+    def _write(self, frame: I3Frame, outputs: List[_ModelOutput]) -> None:
+        """Write each model's output as I3Doubles `<model_name>_<column>`."""
+        for output in outputs:
+            self._write_doubles(frame, output.name, output.values)
+            self._write_doubles(frame, output.name, output.references)
+
+    def _write_doubles(
+        self, frame: I3Frame, name: str, values: Dict[str, float]
+    ) -> None:
+        for column, value in values.items():
+            self._put(frame, name + "_" + column, I3Double(float(value)))
+
+    def _put(self, frame: I3Frame, key: str, value: Any) -> None:
+        """Put `value` in the frame, respecting `overwrite`."""
+        if key in frame:
+            if not self._overwrite:
+                self.warning(
+                    f"{key} already exists in frame and overwrite is False;"
+                    " keeping the existing object."
                 )
-                model_input_data.append(
-                    Batch.from_data_list([data.to(self._device)])
-                )
+                return
+            frame.Delete(key)
+        frame.Put(key, value)
 
-            predictions = self._apply_model(data=model_input_data)
+    def _apply_model(
+        self, data: Optional[Data], deployed: _DeployedModel
+    ) -> np.ndarray:
+        """Apply model to `Data`: all tasks, shape [1, n_columns].
 
-        if self._inference_speed_check is True:
-            if "cuda" in self._device:
-                torch.cuda.synchronize()
-            inference_end = perf_counter()
-            inference_time = inference_end - inference_start
-            #self._logger.info(
-            #    f"Data representation time: {data_repr_time:.4f} s\n"
-            #    f"Inference time: {inference_time:.4f} s\n"
-            #)
-        del data
-        return predictions, data_repr_time, inference_time
-
-    def _check_dimensions(self, predictions: np.ndarray) -> int:
-        if len(predictions.shape) > 1:
-            dim = predictions.shape[1]
-        else:
-            dim = len(predictions)
-        try:
-            assert dim == len(self.prediction_columns)
-        except AssertionError as e:
-            self.error(
-                f"predictions have shape {dim} but"
-                f"prediction columns have [{self.prediction_columns}]"
-            )
-            raise e
-
-        # assert predictions.shape[0] == 1
-        return dim
-
-    def _create_dictionary(
-        self, dim: int, predictions: np.ndarray
-    ) -> Dict[str, Any]:
-        """Transform predictions into a dictionary."""
-        data = {}
-        if self._multiple_models == True:
-            for i, key in enumerate(self.model_name):
-                data[key] = float(predictions[i])
-        else:
-            for i in range(dim):
-                data[self.model_name + "_" + self.prediction_columns[i]] = (
-                    I3Double(float(predictions[i]))
-                )
-
-                # try:
-                #     assert len(predictions[:, i]) == 1
-                #     data[
-                #         self.model_name + "_" + self.prediction_columns[i]
-                #     ] = I3Double(float(predictions[:, i][0]))
-                # except IndexError:
-                #     data[
-                #         self.model_name + "_" + self.prediction_columns[i]
-                #     ] = I3Double(predictions[0])
-        return data
-
-    def _apply_model(self, data: Data) -> np.ndarray:
-        """Apply model to `Data` and case-handling."""
-        if data is not None:
-            predictions = self._inference(data)
-            # print(predictions, type(predictions), type(predictions[0]))
-            if isinstance(predictions, list):
-                predictions = np.concatenate(
-                    [pred.flatten() for pred in predictions]
-                )
-                # warn_bool = len(predictions) > 1
-                # predictions = predictions[0]
-                # if warn_bool:
-                #     self.warning(
-                #         f"{self.__class__.__name__} assumes one Task "
-                #         f"but got {len(predictions)}. Only the first will"
-                #         " be used."
-                #     )
-        else:
+        An event without pulses gets NaN in every column.
+        """
+        n_columns = len(deployed.columns)
+        if data is None:
             self.warning(
-                "At least one event has no pulses "
-                " - padding {self.prediction_columns} with NaN."
+                f"Event without pulses - padding the {deployed.name} "
+                "predictions with NaN."
             )
-            predictions = np.repeat(
-                [np.nan], len(self.prediction_columns)
-            ).reshape(-1, len(self.prediction_columns))
+            return np.full((1, n_columns), np.nan)
+        predictions = concatenate_task_outputs(
+            self._inference(data, deployed.model)
+        )
+        if predictions.shape != (1, n_columns):
+            raise ValueError(
+                f"{deployed.name}: predictions have shape "
+                f"{predictions.shape}, but there are {n_columns} prediction "
+                f"columns {deployed.columns}."
+            )
         return predictions
 
-    def _create_data_representation(self, frame: I3Frame) -> Data:
-        """Process Physics I3Frame into graph."""
-        # Extract features
-        input_features = self._extract_feature_array_from_frame(frame)
-        # Prepare graph data
-        if len(input_features) > 0:
-            data = self._graph_definition(
-                input_features=input_features,
-                input_feature_names=self._features,
-            ).to(self._device)
-            return Batch.from_data_list([data])
-        else:
-            return None
+    def _create_data_representation(self, frame: I3Frame) -> Optional[Batch]:
+        """Process Physics I3Frame into the (first) model's graph."""
+        feature_dicts = [extractor(frame) for extractor in self._i3_extractors]
+        return self._create_graph(feature_dicts, self._deployed[0])
 
-    def _extract_feature_array_from_frame(self, frame: I3Frame) -> np.array:
+    def _extract_feature_array_from_frame(self, frame: I3Frame) -> np.ndarray:
         """Apply the I3FeatureExtractors to the I3Frame.
 
         Arguments:
             frame: Physics I3Frame (PFrame)
 
         Returns:
-            array with pulsemap
+            array with pulsemap, the (first) model's features as columns
         """
-        features = None
-        for i3extractor in self._i3_extractors:
-            feature_dict = i3extractor(frame)
-            if self.multiple_models == False:
-                features_pulsemap = np.array(
-                    [feature_dict[key] for key in self._features]
-                ).T
-                if features is None:
-                    features = features_pulsemap
-                else:
-                    features = np.concatenate(
-                        (features, features_pulsemap), axis=0
-                    )
-                return features
-            if self.multiple_models == True:
-                features_array = []
-                for feature_list in self.features_list:
-                    features = None
-                    features_pulsemap = np.array(
-                        [feature_dict[key] for key in feature_list]
-                    ).T
-                    if features is None:
-                        features = features_pulsemap
-                    else:
-                        features = np.concatenate(
-                            (features, features_pulsemap), axis=0
-                        )
-                    features_array.append(features)
-            return features_array
+        return self._feature_array(
+            [extractor(frame) for extractor in self._i3_extractors],
+            self._features,
+        )
 
-    def _add_to_frame(self, frame: I3Frame, data: Dict[str, Any]) -> None:
-        """Add every field in data to I3Frame.
+    def _add_to_frame(self, frame: I3Frame, data: Dict[str, Any]) -> I3Frame:
+        """Add every field in data to I3Frame (respecting `overwrite`).
 
         Arguments:
             frame: I3Frame (physics)
@@ -386,183 +397,179 @@ class I3InferenceModule(DeploymentModule):
         assert isinstance(
             data, dict
         ), f"data must be of type dict. Got {type(data)}"
-        for key in data.keys():
-            if key not in frame:
-                frame.Put(key, data[key])
-            elif self._overwrite:
-                frame.Delete(key)
-                frame.Put(key, data[key])
-            else:
-                self.warning(
-                    f"{key} already exists in frame and "
-                    f"overwrite is set to False. Skipping adding {key} to "
-                    f"frame."
+        for key, value in data.items():
+            self._put(frame, key, value)
+        return frame
+
+    @staticmethod
+    def _feature_array(
+        feature_dicts: List[Dict[str, Any]], features: List[str]
+    ) -> np.ndarray:
+        """Stack the extracted pulses of all extractors, `features` columns."""
+        return np.concatenate(
+            [
+                np.array([feature_dict[key] for key in features]).T.reshape(
+                    -1, len(features)
                 )
-        return
+                for feature_dict in feature_dicts
+            ],
+            axis=0,
+        )
 
-    def _add_runtimes_to_frame(self, frame, runtimes):
-
-        i3_runtime_container = dataclasses.I3MapStringDouble(runtimes)
-        frame.Put(self.model_name + "_Speed", i3_runtime_container)
-
-    def _check_requirements(self, frame: I3Frame) -> bool:
-        """Check if requirements are met."""
-        for requirement in self._requirements:
-            res = requirement(frame)
-            if not res:
-                return res
-        return True
-
-    def _clean_device(self) -> None:
-        """Clean up the device."""
-        if "cuda" in self._device:
-            torch.cuda.empty_cache()
+    def _create_graph(
+        self, feature_dicts: List[Dict[str, Any]], deployed: _DeployedModel
+    ) -> Optional[Batch]:
+        """Build a model's graph from the extracted pulses (None if empty)."""
+        input_features = self._feature_array(feature_dicts, deployed.features)
+        if len(input_features) == 0:
+            return None
+        data = deployed.model._graph_definition(
+            input_features=input_features,
+            input_feature_names=deployed.features,
+        )
+        return Batch.from_data_list([data]).to(self._device)
 
 
 class I3ParticleInferenceModule(I3InferenceModule):
-    """I3InferenceModule for I3Particle data."""
+    """I3InferenceModule that also writes the reconstruction as I3Particle.
+
+    For each model, the configured direction, position, time and energy
+    columns are written as an `I3Particle` named `<model_name>_particle`
+    instead of as I3Doubles; all other columns are written as I3Doubles.
+    """
 
     def __init__(
         self,
-        directions: List[str],
+        direction: List[str],
+        position: List[str],
         time: str,
         energy: str,
-        positions: List[str],
-        shift_time: bool = False,
-        statistics_dictionary: Optional[str] = None,
-        **kwargs,
+        shape: Optional[Any] = None,
+        **kwargs: Any,
     ):
-        """Initialize the I3ParticleInferenceModule."""
+        """Construct `I3ParticleInferenceModule`.
+
+        Arguments:
+            direction: Prediction columns of the direction: three (Cartesian
+                components, as `I3Direction(x, y, z)`) or two (zenith,
+                azimuth).
+            position: Prediction columns of the position (x, y, z).
+            time: Prediction column of the (absolute) time at `position`.
+            energy: Prediction column of the energy.
+            shape: `I3Particle.ParticleShape` of the particles. Defaults to
+                `InfiniteTrack`.
+            **kwargs: Arguments of `I3InferenceModule`.
+        """
         super().__init__(**kwargs)
+        assert len(direction) in (2, 3), "direction needs 2 or 3 columns"
+        assert len(position) == 3, "position needs 3 columns"
+        self._direction = list(direction)
+        self._position = list(position)
+        self._time = time
+        self._energy = energy
+        self._particle_columns = (
+            self._direction
+            + self._position
+            + [
+                time,
+                energy,
+            ]
+        )
+        for deployed in self._deployed:
+            missing = set(self._particle_columns) - set(deployed.columns)
+            assert (
+                not missing
+            ), f"{deployed.name}: no prediction columns {missing}"
+        self._shape = (
+            shape
+            if shape is not None
+            else I3Particle.ParticleShape.InfiniteTrack
+        )
 
-        self._directions = [
-            self.model_name + "_" + dirs for dirs in directions
-        ]
-        assert (
-            len(self._directions) == 2 or len(self._directions) == 3
-        ), "directions must be a list of 2 or 3 elements"
-        self._time = self.model_name + "_" + time
-        self._energy = self.model_name + "_" + energy
-        self._positions = [self.model_name + "_" + pos for pos in positions]
-        self._shift_time = shift_time
-        self._statistics_dictionary = statistics_dictionary
-        assert (
-            len(self._positions) == 3
-        ), "positions must be a list of 3 elements"
+    def _write(self, frame: I3Frame, outputs: List[_ModelOutput]) -> None:
+        for output in outputs:
+            values = {
+                c: v
+                for c, v in output.values.items()
+                if c not in self._particle_columns
+            }
+            self._put(frame, output.name + "_particle", self._particle(output))
+            self._write_doubles(frame, output.name, values)
+            self._write_doubles(frame, output.name, output.references)
 
-    def _get_min_time(self, frame: I3Frame, pulsemap: str) -> float:
-        """Get the minimum time of the first pulse in the frame."""
-        min_time = np.inf
-        doms = frame[pulsemap].apply(frame).values()
-        # seach for the minimum time
-        for dom in doms:
-            if dom[0].time < min_time:
-                min_time = dom[0].time
-
-        return min_time
-
-    def _add_to_frame(self, frame, data):
-        """Create the I3Particle and add it to the frame."""
-
+    def _particle(self, output: _ModelOutput) -> "I3Particle":
+        values = output.values
         particle = I3Particle()
-
-        directions = [data[k].value for k in self._directions]
-        # drop the directions from the data dictionary
-        for dirs in self._directions:
-            del data[dirs]
-
-        positions = [data[k].value for k in self._positions]
-        # drop the positions from the data dictionary
-        for pos in self._positions:
-            del data[pos]
-
-        particle.dir = I3Direction(*directions)
-
-        if self._shift_time:
-            # Shift time to be relative to the first pulse
-            # The statistics dictionary is optional, so fall back
-            # silently to the pulsemap if it's not found. The pulsemap
-            # itself is required, so its absence is a hard error.
-            shift_time = None
-            if self._statistics_dictionary:
-                if self._statistics_dictionary in frame:
-                    shift_time = frame[
-                        self._statistics_dictionary
-                    ].min_pulse_time
-                else:
-                    self.warning(
-                        f"{self._statistics_dictionary} not found in "
-                        f"frame. Falling back to minimum pulse time "
-                        f"from pulsemap."
-                    )
-
-            if shift_time is None:
-                try:
-                    shift_time = self._get_min_time(
-                        frame, self._pulsemap
-                    )
-                except KeyError as e:
-                    raise KeyError(
-                        f"Tried to get minimum pulse time from "
-                        f"pulsemap '{self._pulsemap}', but it was not "
-                        f"found in frame."
-                    ) from e
-            particle.time = data[self._time].value + shift_time
+        particle.dir = I3Direction(*[values[c] for c in self._direction])
+        particle.pos = I3Position(*[values[c] for c in self._position])
+        particle.time = values[self._time]
+        particle.energy = values[self._energy]
+        particle.shape = self._shape
+        finite = np.isfinite([values[c] for c in self._particle_columns]).all()
+        if not output.has_pulses:
+            particle.fit_status = I3Particle.FitStatus.InsufficientHits
+        elif not finite:
+            particle.fit_status = I3Particle.FitStatus.GeneralFailure
         else:
-            particle.time = data[self._time].value
-        # drop the time from the data dictionary
-        if self._time in data:
-            del data[self._time]
-
-        particle.energy = data[self._energy].value
-        # drop the energy from the data dictionary
-        if self._energy in data:
-            del data[self._energy]
-        # Set the position of the particle
-        particle.pos = I3Position(*positions)
-        particle.shape = I3Particle.ParticleShape.InfiniteTrack
-        particle_name = self.model_name + "_particle"
-        particle.fit_status = I3Particle.FitStatus.OK
-        # Add the particle to the frame
-        if particle_name not in frame:
-            frame.Put(particle_name, particle)
-        elif self._overwrite:
-            frame.Delete(particle_name)
-            frame.Put(particle_name, particle)
-        else:
-            self.warning(
-                f"{particle_name} already exists in frame and "
-                f"overwrite is set to False. Skipping adding particle to "
-                f"frame."
-            )
-
-        # for all the other values in data, add them to an I3Dictionary
-        super()._add_to_frame(frame=frame, data=data)
-        return
+            particle.fit_status = I3Particle.FitStatus.OK
+        return particle
 
 
 class I3MultipleModelInferenceModule(I3InferenceModule):
-    """I3InferenceModule for I3Particle data."""
+    """I3InferenceModule writing all models' outputs into one map.
+
+    The outputs go into one `I3MapStringDouble` named `key_name`: a model
+    with a single prediction column under `<model_name>`, otherwise each
+    column under `<model_name>_<column>` (and its references under
+    `<model_name>_<attribute>`). With `first_column_only`, every model's
+    first prediction column only, under `<model_name>`.
+    """
 
     def __init__(
         self,
-        key_name: List[str],
-        **kwargs,
+        key_name: str,
+        first_column_only: bool = False,
+        multiple_models: Optional[bool] = None,
+        **kwargs: Any,
     ):
-        """
-        key_name: The name used for the key in the I3Frame. Will help define the
-                     named entry in the I3Frame.
+        """Construct `I3MultipleModelInferenceModule`.
+
+        Arguments:
+            key_name: Name of the `I3MapStringDouble` in the frame. Runtimes
+                (`record_runtimes`) are written as `<key_name>_Speed`.
+            first_column_only: If True, write only each model's first
+                prediction column (of its first task), under `<model_name>`;
+                e.g. the first-class probability of a classifier. This is
+                the map layout of the earlier `multiple_models=True` modules.
+            multiple_models: Deprecated: True means `first_column_only`.
+            **kwargs: Arguments of `I3InferenceModule`.
         """
         super().__init__(**kwargs)
-
+        if multiple_models is not None:
+            self.warning(
+                "`multiple_models` is deprecated: several models are always "
+                "supported; `multiple_models=True` now means "
+                "`first_column_only=True`."
+            )
+            first_column_only = first_column_only or multiple_models
         self._key_name = key_name
+        self._first_column_only = first_column_only
 
-    def _add_to_frame(self, frame, data):
+    def _runtimes_key(self) -> str:
+        return self._key_name + "_Speed"
 
-        i3_score_container = dataclasses.I3MapStringDouble(data)
-        frame.Put(self._key_name, i3_score_container)
-
-    def _add_runtimes_to_frame(self, frame, runtimes):
-
-        i3_runtime_container = dataclasses.I3MapStringDouble(runtimes)
-        frame.Put(self._key_name + "_Speed", i3_runtime_container)
+    def _write(self, frame: I3Frame, outputs: List[_ModelOutput]) -> None:
+        scores: Dict[str, float] = {}
+        for output in outputs:
+            if self._first_column_only:
+                scores[output.name] = float(next(iter(output.values.values())))
+                continue
+            if len(output.values) == 1 and not output.references:
+                scores[output.name] = float(*output.values.values())
+                continue
+            for column, value in {
+                **output.values,
+                **output.references,
+            }.items():
+                scores[output.name + "_" + column] = float(value)
+        self._put(frame, self._key_name, I3MapStringDouble(scores))

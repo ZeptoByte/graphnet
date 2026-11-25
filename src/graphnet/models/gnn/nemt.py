@@ -1,0 +1,568 @@
+"""Neutrino Event Multitask Transformer (NEMT).
+
+A transformer backbone producing one output token group per task, for
+reconstructing several quantities of an event with a single model.
+"""
+
+from typing import List, Optional, Sequence, Set, Tuple, Union
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+from torch.utils.checkpoint import checkpoint
+from torch_geometric.data import Data
+
+from graphnet.models.components.attention_blocks import (
+    MLP_TYPES,
+    Block,
+    Block_rel,
+)
+from graphnet.models.components.embedding import (
+    SinusoidalPosEmb,
+    SpacetimeEncoder,
+    signed_four_distance,
+)
+from graphnet.models.gnn.gnn import GNN
+from graphnet.models.utils import array_to_sequence
+
+# pair terms of the relative-bias basis (`pair_features`)
+PAIR_FEATURES = ("distance", "time_difference", "dz")
+
+
+class NeutrinoEventMultitaskTransformer(GNN):
+    """Transformer with learned task tokens for multitask reconstruction.
+
+    Node features are embedded with sinusoidal embeddings and an MLP, and
+    processed by `n_attention_blocks` self-attention blocks, of which the first
+    `n_rel` use a relative space-time bias. After block `inject_cls_after`,
+    `n_tasks` task tokens (and optionally `shared_tokens` shared tokens) are
+    prepended to the sequence. After each block listed in `cross_attention`,
+    the tokens are additionally updated by a token-only attention block through
+    a learned gate, `t + sigmoid(g) * (block(t) - t)`. The task tokens of the
+    final block are projected to `out_dim` and concatenated, giving
+    `n_tasks * out_dim` outputs that can be routed to tasks with
+    `StandardModel(split=...)`.
+
+    With `isolate_task_tokens` the task tokens are read-out queries: in the
+    self-attention blocks each task attends to the nodes, the shared tokens
+    and its own tokens, and nothing attends to the task tokens, so the tasks
+    exchange information only through the gated token-only blocks, which
+    then hold only the task tokens.
+    """
+
+    def __init__(
+        self,
+        n_attention_blocks: int = 2,
+        n_rel: int = 1,
+        inject_cls_after: int = 0,
+        hidden_dim: int = 128,
+        num_heads: int = 4,
+        mlp_ratio: int = 4,
+        n_features: int = 36,
+        pre_emb_scale: float = 1024.0,
+        n_tasks: int = 1,
+        shared_tokens: int = 0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        token_multiplier: int = 1,
+        out_dim: Optional[int] = None,
+        cross_attention: Optional[List[int]] = None,
+        embed_bias: bool = True,
+        spacetime_time_index: int = 3,
+        spacetime_time_scale: float = 3e4 / 500 * 3e-1,
+        factor_rel_bias: bool = True,
+        rel_bias_widths: Optional[Sequence[float]] = None,
+        per_block_rel_bias: bool = False,
+        qk_norm: bool = False,
+        pair_features: Optional[Sequence[str]] = None,
+        isolate_task_tokens: bool = False,
+        final_norm: bool = False,
+        mlp_type: str = "gelu",
+        activation_checkpointing: Union[bool, int] = False,
+        channel_gates: bool = False,
+        gate_init: Optional[float] = None,
+    ):
+        """Construct `NeutrinoEventMultitaskTransformer`.
+
+        Args:
+            n_attention_blocks: Number of self-attention blocks.
+            n_rel: Number of leading blocks using the relative space-time
+                bias.
+            inject_cls_after: Index of the block before which the task (and
+                shared) tokens are prepended to the sequence.
+            hidden_dim: Latent feature dimension.
+            num_heads: Number of attention heads.
+            mlp_ratio: Hidden-size ratio of the attention blocks' MLPs.
+            n_features: Number of input node features.
+            pre_emb_scale: Scale applied to the node features before the
+                sinusoidal embedding.
+            n_tasks: Number of task token groups (outputs).
+            shared_tokens: Number of additional tokens that attend with the
+                task tokens but are not returned.
+            dropout: Dropout rate in the self-attention blocks.
+            drop_path: Stochastic-depth rate in the token-only blocks.
+            token_multiplier: Number of tokens per task (and per shared
+                token); a task's tokens are concatenated before projection.
+            out_dim: If given, each task's tokens are projected to `out_dim`
+                by an MLP; otherwise the raw tokens are returned.
+            cross_attention: Indices of the blocks after which the tokens are
+                updated by a gated token-only attention block.
+            embed_bias: If True, the space-time interval is sinusoidally
+                embedded before its projection to the relative bias.
+            spacetime_time_index: Node-feature column used as time in the
+                relative space-time bias (columns 0-2 are the positions).
+                E.g. for `ClusterSummaryFeatures` this is the column of
+                `time_of_first_hit`.
+            spacetime_time_scale: Light travel distance per unit of the
+                time column, in units of the position columns (see
+                `SpacetimeEncoder`). E.g. 0.6 for times in microseconds and
+                positions in units of 500 m.
+            factor_rel_bias: Without `embed_bias` the relative encoding is
+                affine in the four-distance; pass it to the attention in
+                factored form (same attention, without the `[B, L, L,
+                head_dim]` tensor; ~head_dim times less memory and work for
+                the relative term). Has no effect with `embed_bias`.
+            rel_bias_widths: Without `embed_bias`, make the relative
+                encoding non-linear in the four-distance `d`: a fixed basis
+                `[d, exp(-(d / s)**2) for s in rel_bias_widths]` (widths in
+                units of the position columns), projected linearly to the
+                head dimension, `sum_k phi_k(d) w_k + b`, and passed to the
+                attention in factored form (cost ~K times the linear
+                term). None (default): the encoding is affine in `d`.
+            per_block_rel_bias: If True, each of the `n_rel` blocks has its
+                own projection of the (shared) four-distance basis;
+                otherwise all of them use the same one. Requires
+                `embed_bias=False`.
+            qk_norm: If True, the blocks without relative bias (the
+                self-attention blocks from `n_rel` on and the token-only
+                blocks) normalize queries and keys and scale the logits by
+                a learned temperature per head (`QKNormAttention`), which
+                bounds the attention logits. The temperatures are not
+                weight-decayed.
+            pair_features: Pair terms added to the relative-bias basis
+                (requires `embed_bias=False`), in units of the position
+                columns, for query node `i` and key node `j`:
+                `"distance"` the spatial distance `|r_i - r_j|`,
+                `"time_difference"` the signed `(t_i - t_j)` times
+                `spacetime_time_scale`, `"dz"` the signed `z_i - z_j`. The
+                four-distance alone does not separate space from time and
+                is symmetric in `i, j`; these terms give the attention the
+                causal order and the depth. Each adds one basis term.
+            isolate_task_tokens: If True, the task tokens are read-out
+                queries (see the class docstring): no node, shared token or
+                other task attends to a task's tokens in the self-attention
+                blocks, and the token-only blocks hold the task tokens only.
+            final_norm: If True, each task token of the final block is
+                layer-normalized (one `LayerNorm` shared by all tokens) before
+                the optional `out_dim` projection, as in pre-norm
+                transformers. Without `out_dim` the tasks then read
+                normalized tokens directly.
+            mlp_type: Feed-forward network of all attention blocks (self-
+                attention and token-only): "gelu" (default, two-layer GELU
+                MLP of width `mlp_ratio * hidden_dim`) or "swiglu" (gated
+                SiLU network of width `2/3 * mlp_ratio * hidden_dim`, about
+                the same parameters and FLOPs; Shazeer 2020). The
+                embedding MLP and `out_dim` projection are unchanged.
+            activation_checkpointing: If True, the self-attention blocks
+                do not keep their activations for the backward pass in
+                training; they are recomputed instead (`torch.utils.
+                checkpoint`, non-reentrant). Lower memory for roughly one
+                extra forward pass per step; no effect in evaluation and
+                no change of the parameters or outputs. An integer `k`
+                checkpoints only the first `k` blocks (e.g. `n_rel`: the
+                relative-bias blocks, which hold the `[L, L]` pair terms).
+            channel_gates: If True, the gated update of the tokens after
+                each token-only block (`cross_attention`) has one gate per
+                token and feature channel (`[1, n_tokens, hidden_dim]`,
+                like the per-channel scales of the cross-task attention of
+                Lopes et al. 2022) instead of one per token
+                (`[1, n_tokens, 1]`, default). Both start at sigmoid(0).
+            gate_init: Start value of the gate parameters before the
+                sigmoid, e.g. -3 (gate 0.047): the token-only blocks start
+                almost switched off, as the zero-initialised scales of the
+                cross-task attention of Lopes et al. 2022. If given, the
+                gates are also excluded from weight decay (which would pull
+                them back to 0, i.e. a gate of 0.5). None (default): 0,
+                weight-decayed as before.
+        """
+        cross_attention = list(cross_attention or [])
+        tot_out = (out_dim if out_dim is not None else hidden_dim) * n_tasks
+        super().__init__(n_features, tot_out)
+
+        assert (
+            hidden_dim % num_heads == 0
+        ), "hidden_dim must be divisible by num_heads"
+        assert (
+            n_rel < n_attention_blocks
+        ), "n_rel must be less than n_attention_blocks"
+        assert (
+            inject_cls_after < n_attention_blocks
+        ), "inject_cls_after must be less than n_attention_blocks"
+        assert (
+            inject_cls_after >= n_rel
+        ), "inject_cls_after must be greater than or equal to n_rel"
+        assert all(
+            inject_cls_after <= c < n_attention_blocks for c in cross_attention
+        ), "cross_attention blocks must lie in [inject_cls_after, n_blocks)"
+
+        self.embedding = SinusoidalPosEmb(dim=hidden_dim)
+        self.emb_mlp = nn.Sequential(
+            nn.Linear(n_features * hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        if mlp_type not in MLP_TYPES:
+            raise ValueError(
+                f"mlp_type must be one of {MLP_TYPES}, got {mlp_type}"
+            )
+        if isinstance(activation_checkpointing, bool):
+            self._n_checkpointed = (
+                n_attention_blocks if activation_checkpointing else 0
+            )
+        else:
+            if not 0 <= int(activation_checkpointing) <= n_attention_blocks:
+                raise ValueError(
+                    "activation_checkpointing must be a bool or a number "
+                    f"of blocks in [0, {n_attention_blocks}], got "
+                    f"{activation_checkpointing}"
+                )
+            self._n_checkpointed = int(activation_checkpointing)
+        self.activation_checkpointing = self._n_checkpointed > 0
+        self.ESA = nn.ModuleList(
+            [
+                (
+                    Block_rel(
+                        hidden_dim,
+                        num_heads,
+                        mlp_ratio=mlp_ratio,
+                        dropout=dropout,
+                        mlp_type=mlp_type,
+                    )
+                    if i < n_rel
+                    else Block(
+                        hidden_dim,
+                        num_heads,
+                        mlp_ratio=mlp_ratio,
+                        dropout=dropout,
+                        qk_norm=qk_norm,
+                        mlp_type=mlp_type,
+                    )
+                )
+                for i in range(n_attention_blocks)
+            ]
+        )
+
+        # with isolated task tokens the token-only blocks hold no shared tokens
+        n_tokens = (
+            n_tasks if isolate_task_tokens else n_tasks + shared_tokens
+        ) * token_multiplier
+        self.xTAMS = nn.ModuleList(
+            [
+                Block(
+                    hidden_dim,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    drop_path=drop_path,
+                    qk_norm=qk_norm,
+                    mlp_type=mlp_type,
+                )
+                for _ in cross_attention
+            ]
+        )
+        gate_width = hidden_dim if channel_gates else 1
+        self._decay_gates = gate_init is None
+        self.gates = nn.ParameterList(
+            [
+                nn.Parameter(
+                    torch.full(
+                        (1, n_tokens, gate_width),
+                        0.0 if gate_init is None else float(gate_init),
+                    )
+                )
+                for _ in cross_attention
+            ]
+        )
+
+        self.task_tokens = nn.Parameter(
+            torch.empty(1, n_tasks * token_multiplier, hidden_dim)
+        )
+        nn.init.xavier_normal_(self.task_tokens, gain=1.0)
+        self.shared_tokens: Optional[nn.Parameter] = None
+        if shared_tokens > 0:
+            self.shared_tokens = nn.Parameter(
+                torch.empty(1, shared_tokens * token_multiplier, hidden_dim)
+            )
+            nn.init.xavier_normal_(self.shared_tokens, gain=1.0)
+
+        head_dim = hidden_dim // num_heads
+        # basis / per-block projections of the four-distance, instead of
+        # `rel_pos`: the distance is computed once, each projection owns
+        # its weights (`rel_pos` would leave unused parameters)
+        pair_features = list(pair_features or [])
+        unknown = set(pair_features) - set(PAIR_FEATURES)
+        assert not unknown, f"Unknown pair features {sorted(unknown)}."
+        self._pair_features = pair_features
+        self._basis_rel_bias = (
+            rel_bias_widths is not None
+            or per_block_rel_bias
+            or bool(pair_features)
+        )
+        if self._basis_rel_bias:
+            assert not embed_bias, (
+                "`rel_bias_widths` / `per_block_rel_bias` / `pair_features` "
+                "need embed_bias=False."
+            )
+            assert n_rel > 0, "`rel_bias_widths` needs a block with n_rel > 0."
+            widths = [float(w) for w in (rel_bias_widths or [])]
+            assert all(w > 0 for w in widths), "Widths must be positive."
+            self._rel_bias_widths = widths
+            self._spacetime_columns = (0, 1, 2, spacetime_time_index)
+            self._spacetime_time_scale = spacetime_time_scale
+            n_basis = 1 + len(widths) + len(pair_features)
+            self.rel_proj = nn.ModuleList(
+                [
+                    nn.Linear(n_basis, head_dim)
+                    for _ in range(n_rel if per_block_rel_bias else 1)
+                ]
+            )
+        elif n_rel > 0:
+            # without the sinusoidal embedding the raw four-distance is
+            # projected unclipped
+            self.rel_pos = SpacetimeEncoder(
+                head_dim,
+                output_dim=head_dim,
+                columns=(0, 1, 2, spacetime_time_index),
+                time_scale=spacetime_time_scale,
+                clip=4.0 if embed_bias else None,
+                apply_sin_emb=embed_bias,
+            )
+
+        self.final_norm: Optional[nn.Module] = (
+            nn.LayerNorm(hidden_dim) if final_norm else None
+        )
+        self.task_out: Optional[nn.Module] = None
+        if out_dim is not None:
+            self.task_out = nn.Sequential(
+                nn.Linear(hidden_dim * token_multiplier, out_dim),
+                nn.LayerNorm(out_dim),
+                nn.GELU(),
+                nn.Linear(out_dim, out_dim),
+            )
+
+        self.n_rel = n_rel
+        self._factor_rel_bias = factor_rel_bias and not embed_bias
+        self.n_tasks = n_tasks
+        self.inject_cls_after = inject_cls_after
+        self.cross_attention = cross_attention
+        self.token_multiplier = token_multiplier
+        self.pre_emb_scale = pre_emb_scale
+        self.isolate_task_tokens = isolate_task_tokens
+
+    @torch.jit.ignore
+    def no_weight_decay(self) -> Set:
+        """Return the parameters to exclude from weight decay.
+
+        The learned tokens and attention temperatures, and the gates when
+        `gate_init` is given.
+        """
+        names = {"task_tokens", "shared_tokens"} | {
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith("attn.log_temperature")
+        }
+        if not self._decay_gates:
+            names.add("gates")
+        return names
+
+    def forward(self, data: Data) -> Tensor:
+        """Apply learnable forward pass to input data."""
+        # node counts known on the CPU (bucketing collator): no GPU sync
+        x, mask, _ = array_to_sequence(
+            data.x, data.batch, seq_length=getattr(data, "node_counts", None)
+        )
+        batch_size = mask.shape[0]
+
+        if self._basis_rel_bias:
+            basis = self._rel_bias_basis(x)
+        elif self.n_rel > 0:
+            if self._factor_rel_bias:
+                rel_pos_bias = self.rel_pos.affine_factors(x)
+            else:
+                rel_pos_bias = self.rel_pos(x)
+
+        attn_mask = torch.zeros(mask.shape, device=mask.device)
+        attn_mask[~mask] = -torch.inf
+
+        tokens = self.task_tokens.expand(batch_size, -1, -1)
+        n_task_tokens = tokens.shape[1]
+        n_shared = 0
+        if self.shared_tokens is not None:
+            shared = self.shared_tokens.expand(batch_size, -1, -1)
+            n_shared = shared.shape[1]
+            tokens = torch.cat([shared, tokens], 1)
+        n_tokens = n_shared + n_task_tokens
+        # tokens updated by the token-only blocks
+        xtam_start = n_shared if self.isolate_task_tokens else 0
+        token_mask: Optional[Tensor] = None
+
+        x = self.embedding(self.pre_emb_scale * x).flatten(-2)
+        x = self.emb_mlp(x)
+
+        for i, block in enumerate(self.ESA):
+            if i == self.inject_cls_after:
+                x = torch.cat([tokens, x], 1)
+                attn_mask = create_attn_mask(mask, add_tokens=n_tokens)
+                if self.isolate_task_tokens:
+                    token_mask = create_readout_mask(
+                        n_shared,
+                        n_task_tokens,
+                        x.shape[1],
+                        self.token_multiplier,
+                        device=x.device,
+                    )
+
+            if i < self.n_rel:
+                if self._basis_rel_bias:
+                    proj = self.rel_proj[min(i, len(self.rel_proj) - 1)]
+                    rel_pos_bias = self._basis_factors(basis, proj)
+                args = (x, attn_mask, rel_pos_bias)
+            elif i >= self.inject_cls_after:
+                args = (x, token_mask, attn_mask)
+            else:
+                args = (x, None, attn_mask)
+            if i < self._n_checkpointed and self.training:
+                x = checkpoint(block, *args, use_reentrant=False)
+            else:
+                x = block(*args)
+
+            if i in self.cross_attention:
+                idx = self.cross_attention.index(i)
+                token_part = x[:, xtam_start:n_tokens]
+                # Gated residual update: interpolate between the tokens and
+                # the output of the token-only block.
+                gate = torch.sigmoid(self.gates[idx])
+                token_part = token_part + gate * (
+                    self.xTAMS[idx](token_part) - token_part
+                )
+                x = torch.cat(
+                    [x[:, :xtam_start], token_part, x[:, n_tokens:]], 1
+                )
+
+        # Task tokens of the final block (shared tokens are dropped).
+        x = x[:, n_shared:n_tokens]
+        if self.final_norm is not None:
+            x = self.final_norm(x)
+        if self.token_multiplier > 1:
+            x = x.reshape(
+                batch_size, self.n_tasks, self.token_multiplier * x.shape[-1]
+            )
+        if self.task_out is not None:
+            x = self.task_out(x)
+        return x.flatten(1, 2)
+
+    def _rel_bias_basis(self, x: Tensor) -> Tensor:
+        """Return the relative-bias basis, `[B, L, L]` or `[B, K, L, L]`."""
+        distance = signed_four_distance(
+            x, self._spacetime_time_scale, self._spacetime_columns
+        )
+        if not self._rel_bias_widths and not self._pair_features:
+            return distance
+        return torch.stack(
+            [distance]
+            + [
+                torch.exp(-((distance / width) ** 2))
+                for width in self._rel_bias_widths
+            ]
+            + self._pair_terms(x),
+            1,
+        )
+
+    def _pair_terms(self, x: Tensor) -> List[Tensor]:
+        """Return the `pair_features` terms, each `[B, L, L]`."""
+        xi, yi, zi, ti = self._spacetime_columns
+        terms = []
+        for name in self._pair_features:
+            if name == "distance":
+                # stacked columns, not a list index (a GPU sync per call)
+                pos = torch.stack(
+                    [x[:, :, xi], x[:, :, yi], x[:, :, zi]], dim=-1
+                )
+                term = (pos[:, :, None] - pos[:, None, :]).pow(2).sum(-1)
+                term = term.sqrt()
+            elif name == "time_difference":
+                time = x[:, :, ti]
+                term = (time[:, :, None] - time[:, None, :]) * (
+                    self._spacetime_time_scale
+                )
+            else:  # "dz"
+                term = x[:, :, zi, None] - x[:, None, :, zi]
+            terms.append(term)
+        return terms
+
+    @staticmethod
+    def _basis_factors(
+        basis: Tensor, proj: nn.Linear
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Return the factors `(phi, w, b)` for `Attention_rel`."""
+        if basis.dim() == 3:  # linear in the distance: as `affine_factors`
+            return basis, proj.weight[:, 0], proj.bias
+        return basis, proj.weight.t(), proj.bias
+
+
+def create_readout_mask(
+    n_shared: int,
+    n_task_tokens: int,
+    length: int,
+    token_multiplier: int = 1,
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """Create the additive attention mask of isolated task tokens.
+
+    For a sequence `[shared tokens, task tokens, nodes]` of `length`: the
+    task tokens (groups of `token_multiplier` per task) are attended only by
+    their own task's tokens, so each task reads the shared tokens and nodes
+    without seeing, or being seen by, the other tasks.
+
+    Returns:
+        Float mask of shape [length, length], 0 where attended and -inf
+        where not (rows are queries).
+    """
+    task = torch.full((length,), -1, dtype=torch.long, device=device)
+    task[n_shared : n_shared + n_task_tokens] = (
+        torch.arange(n_task_tokens, device=device) // token_multiplier
+    )
+    is_task_key = task[None, :] >= 0
+    blocked = is_task_key & (task[:, None] != task[None, :])
+    readout_mask = torch.zeros(length, length, device=device)
+    return readout_mask.masked_fill(blocked, -torch.inf)
+
+
+def create_attn_mask(mask: Tensor, add_tokens: int = 0) -> Tensor:
+    """Create an additive key-padding mask, with `add_tokens` leading tokens.
+
+    Args:
+        mask: Boolean mask of valid sequence elements, shape [B, L].
+        add_tokens: Number of (always valid) tokens prepended to the sequence.
+
+    Returns:
+        Float mask of shape [B, add_tokens + L], 0 where valid and -inf where
+        padded.
+    """
+    if add_tokens > 0:
+        mask = torch.cat(
+            [
+                torch.ones(
+                    mask.shape[0],
+                    add_tokens,
+                    dtype=mask.dtype,
+                    device=mask.device,
+                ),
+                mask,
+            ],
+            1,
+        )
+    attn_mask = torch.zeros(mask.shape, device=mask.device)
+    attn_mask[~mask] = -torch.inf
+    return attn_mask

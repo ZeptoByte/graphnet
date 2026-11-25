@@ -11,6 +11,7 @@ from graphnet.data.dataset import (
     EnsembleDataset,
     SQLiteDataset,
     ParquetDataset,
+    LMDBDataset,
 )
 from graphnet.utilities.logging import Logger
 from graphnet.data.dataloader import DataLoader
@@ -22,7 +23,10 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
     def __init__(
         self,
         dataset_reference: Union[
-            Type[SQLiteDataset], Type[ParquetDataset], Type[Dataset]
+            Type[SQLiteDataset],
+            Type[ParquetDataset],
+            Type[LMDBDataset],
+            Type[Dataset],
         ],
         dataset_args: Dict[str, Any],
         selection: Optional[Union[List[int], List[List[int]]]] = None,
@@ -127,10 +131,11 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
         """Handle assignment of `multiprocessing_context` arg to loaders.
 
         Datasets relying on threaded libraries often require the
-        multiprocessing context to be set to "spawn" if "num_workers" > 0. This
-        method will check the arguments for this entry and throw an error if
-        the field is already assigned to a wrong value. If the value is not
-        specified, it is added automatically with a log entry.
+        multiprocessing context to be set to "spawn" if "num_workers" >
+        0. This method will check the arguments for this entry and throw
+        an error if the field is already assigned to a wrong value. If
+        the value is not specified, it is added automatically with a log
+        entry.
         """
         arg = "multiprocessing_context"
         if dataloader_args["num_workers"] != 0:
@@ -191,7 +196,7 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
         if stage == "fit" or stage == "validate":
             if self._train_selection is not None:
                 self._train_dataset = self._create_dataset(
-                    self._train_selection
+                    self._train_selection, augment=True
                 )
             if self._val_selection is not None:
                 self._val_dataset = self._create_dataset(self._val_selection)
@@ -246,6 +251,22 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
 
         if hasattr(self, "_test_dataset") and isinstance(
             self._test_dataset, SQLiteDataset
+        ):
+            self._test_dataset._close_connection()
+
+        # Close LMDB connections
+        if hasattr(self, "_train_dataset") and isinstance(
+            self._train_dataset, LMDBDataset
+        ):
+            self._train_dataset._close_connection()
+
+        if hasattr(self, "_val_dataset") and isinstance(
+            self._val_dataset, LMDBDataset
+        ):
+            self._val_dataset._close_connection()
+
+        if hasattr(self, "_test_dataset") and isinstance(
+            self._test_dataset, LMDBDataset
         ):
             self._test_dataset._close_connection()
 
@@ -316,14 +337,15 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
         """Sanity checks on the dataset reference (self._dataset).
 
         Checks whether the dataset is an instance of SQLiteDataset,
-        ParquetDataset, or Dataset. Raises a TypeError if an invalid dataset
-        type is detected, or if an EnsembleDataset is used.
+        ParquetDataset, LMDBDataset, or Dataset. Raises a TypeError if
+        an invalid dataset type is detected, or if an EnsembleDataset is
+        used.
         """
-        allowed_types = (SQLiteDataset, ParquetDataset, Dataset)
+        allowed_types = (SQLiteDataset, ParquetDataset, LMDBDataset, Dataset)
         if self._dataset not in allowed_types:
             raise TypeError(
                 "dataset_reference must be an instance "
-                "of SQLiteDataset, ParquetDataset, or Dataset."
+                "of SQLiteDataset, ParquetDataset, LMDBDataset, or Dataset."
             )
         if self._dataset is EnsembleDataset:
             raise TypeError(
@@ -525,12 +547,16 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
         return dataset
 
     def _create_dataset(
-        self, selection: Union[List[int], List[List[int]], List[float]]
+        self,
+        selection: Union[List[int], List[List[int]], List[float]],
+        augment: bool = False,
     ) -> Union[EnsembleDataset, Dataset]:
         """Instantiate `dataset_reference`.
 
         Args:
             selection: The selected event id's.
+            augment: Keep the data augmentations of `dataset_args`, if any.
+                Only the training dataset is augmented.
 
         Returns:
             A dataset, either an instance of `EnsembleDataset` or `Dataset`.
@@ -544,6 +570,7 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
                     self._create_single_dataset(
                         selection=selection[dataset_idx],  # type: ignore
                         path=self._dataset_args["path"][dataset_idx],
+                        augment=augment,
                     )
                 )
 
@@ -553,7 +580,8 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
             # Construct single dataset
             dataset = self._create_single_dataset(
                 selection=selection,
-                path=self._dataset_args["path"],  # type:ignore
+                path=self._dataset_args["path"],  # type: ignore
+                augment=augment,
             )
         return dataset
 
@@ -561,12 +589,14 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
         self,
         selection: Union[List[int], List[List[int]], List[float]],
         path: str,
+        augment: bool = False,
     ) -> Dataset:
         """Instantiate a single `Dataset`.
 
         Args:
             selection: A selection for a single dataset.
             path: Path to a single dataset
+            augment: Keep the data augmentations of `dataset_args`, if any.
 
         Returns:
             An instance of `Dataset`.
@@ -574,4 +604,6 @@ class GraphNeTDataModule(pl.LightningDataModule, Logger):
         tmp_args = deepcopy(self._dataset_args)
         tmp_args["path"] = path
         tmp_args["selection"] = selection
+        if not augment:
+            tmp_args.pop("augmentations", None)
         return self._construct_dataset(tmp_args)

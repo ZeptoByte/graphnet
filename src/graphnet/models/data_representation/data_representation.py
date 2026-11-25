@@ -8,7 +8,6 @@ from numpy.random import default_rng, Generator
 
 from graphnet.models.detector import Detector
 from graphnet.models import Model
-from abc import abstractmethod
 
 
 class DataRepresentation(Model):
@@ -203,6 +202,25 @@ class DataRepresentation(Model):
 
         # Add data representation Stamp
         data["data_representation"] = self.__class__.__name__
+
+        # Warn on empty events; the representation will hold no nodes/pulses,
+        # which is rarely what the user intends.
+        if data.x.shape[0] == 0:
+            event_no = getattr(data, "event_no", None)
+            if isinstance(event_no, torch.Tensor):
+                event_no = event_no.tolist()
+            msg = (
+                f"{self.__class__.__name__} received an empty input tensor "
+                f"(no pulses) for event_no={event_no}"
+            )
+            if data_path is not None:
+                msg += f" in dataset '{data_path}'"
+            msg += (
+                ". This event will be turned into an empty data "
+                "representation; check your input data if this is unexpected."
+            )
+            self.warning(msg)
+
         return data
 
     def _resolve_masks(self) -> None:
@@ -231,9 +249,9 @@ class DataRepresentation(Model):
     ) -> np.ndarray:
         """Attach inactive sensors to `input_features`.
 
-        This function will query the detector geometry table and add any sensor
-        in the geometry table that is not already present in queried data per
-        event.
+        This function will query the detector geometry table and add any
+        sensor in the geometry table that is not already present in
+        queried data per event.
         """
         lookup = self._geometry_table_lookup(
             input_features, input_feature_names
@@ -289,23 +307,21 @@ class DataRepresentation(Model):
         # `DataRepresentation` was instantiated with.
         assert len(input_feature_names) == len(
             self._input_feature_names
-        ), f"""Input features ({input_feature_names}) is not what 
+        ), f"""Input features ({input_feature_names}) is not what
                {self.__class__.__name__} was instatiated
                with ({self._input_feature_names})"""  # noqa
         for idx in range(len(input_feature_names)):
             assert (
                 input_feature_names[idx] == self._input_feature_names[idx]
             ), f""" Order of representation features in data
-                    are not the same as expected. Got {input_feature_names} 
+                    are not the same as expected. Got {input_feature_names}
                     vs. {self._input_feature_names}"""  # noqa
 
     def _perturb_input(self, input_features: np.ndarray) -> np.ndarray:
         if isinstance(self._perturbation_dict, dict):
-            self.warning_once(
-                f"""Will randomly perturb
+            self.warning_once(f"""Will randomly perturb
                 {list(self._perturbation_dict.keys())}
-                using stds {self._perturbation_dict.values()}"""  # noqa
-            )
+                using stds {self._perturbation_dict.values()}""")  # noqa
             perturbed_features = self.rng.normal(
                 loc=input_features[:, self._perturbation_cols],
                 scale=np.array(
@@ -406,7 +422,6 @@ class DataRepresentation(Model):
                     )
         return data
 
-    @abstractmethod
     def _set_output_feature_names(
         self, input_feature_names: List[str]
     ) -> List[str]:

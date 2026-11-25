@@ -52,6 +52,18 @@ class FEATURES:
     ]
     KAGGLE = ["x", "y", "z", "time", "charge", "auxiliary"]
     LIQUIDO = ["sipm_x", "sipm_y", "sipm_z", "t"]
+    KM3NET = [
+        "t",
+        "pos_x",
+        "pos_y",
+        "pos_z",
+        "dir_x",
+        "dir_y",
+        "dir_z",
+        "tot",
+        "trig",
+    ]
+    KM3NET_HNL = KM3NET
 
 
 class TRUTH:
@@ -71,13 +83,25 @@ class TRUTH:
         "interaction_type",
         "interaction_time",  # Added for vertex reconstruction
         "inelasticity",
-        "visible_inelasticity",
-        "visible_energy",
         "stopped_muon",
     ]
     DEEPCORE = ICECUBE86
     UPGRADE = DEEPCORE
+    # Truth schema written by current Prometheus versions; the default
+    # column list of `PrometheusTruthExtractor`.
     PROMETHEUS = [
+        "interaction",
+        "initial_state_energy",
+        "initial_state_type",
+        "initial_state_zenith",
+        "initial_state_azimuth",
+        "initial_state_x",
+        "initial_state_y",
+        "initial_state_z",
+    ]
+    # Truth schema written by older Prometheus versions, e.g. the bundled
+    # example database `prometheus-events.db`.
+    PROMETHEUS_LEGACY = [
         "injection_energy",
         "injection_type",
         "injection_interaction_type",
@@ -166,4 +190,50 @@ class TRUTH:
         "interaction_time",
         "energy",
         "pid",
+    ]
+    KM3NET = [
+        "true_pdgid",
+        "true_E",
+        "true_pos_x",
+        "true_pos_y",
+        "true_pos_z",
+        "true_dir_x",
+        "true_dir_y",
+        "true_dir_z",
+        "true_zenith",
+        "true_azimuth",
+        "run_id",
+        "evt_id",
+        "frame_index",
+        "trigger_counter",
+        "n_hits",
+        "event_no",
+        "is_cc_flag",
+        "tau_topology",
+    ]
+    KM3NET_HNL = [
+        "true_pdgid",
+        "true_E",
+        "true_pos_x",
+        "true_pos_y",
+        "true_pos_z",
+        "true_dir_x",
+        "true_dir_y",
+        "true_dir_z",
+        "true_zenith",
+        "run_id",
+        "evt_id",
+        "frame_index",
+        "trigger_counter",
+        "n_hits",
+        "event_no",
+        "is_cc_flag",
+        "tau_topology",
+        "zenith_hnl",
+        "azimuth_hnl",
+        "angle_between_showers",
+        "Energy_hnl",
+        "Energy_second_shower",
+        "Energy_imbalance",
+        "distance",
     ]

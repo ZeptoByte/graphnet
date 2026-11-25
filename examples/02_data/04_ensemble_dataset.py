@@ -1,9 +1,7 @@
 """Example of combining multiple Datasets using EnsembleDataset."""
 
 import time
-from timer import timer
-import torch.multiprocessing
-import torch.utils.data
+import torch
 from torch_geometric.data.batch import Batch
 from tqdm import tqdm
 
@@ -74,19 +72,16 @@ def main() -> None:
         prefetch_factor=2,
     )
 
-    with timer("torch dataloader"):
-        for batch in tqdm(dataloader, unit=" batches", colour="green"):
-            time.sleep(wait_time)
+    for batch in tqdm(dataloader, unit=" batches", colour="green"):
+        time.sleep(wait_time)
 
     for i in range(batch_size):
         logger.info(f"Event {i} came from {batch['dataset_path'][i]}")
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(
-        description="""
+    parser = ArgumentParser(description="""
 Combine multiple Datasets using EnsembleDataset.
-"""
-    )
+""")
     args, unknown = parser.parse_known_args()
     main()

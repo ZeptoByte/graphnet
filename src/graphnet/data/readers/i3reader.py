@@ -14,7 +14,6 @@ from graphnet.data.dataclasses import I3FileSet
 from graphnet.utilities.filesys import find_i3_files
 from .graphnet_file_reader import GraphNeTFileReader
 
-
 if has_icecube_package():
     from icecube import icetray, dataio  # pyright: reportMissingImports=false
     from icecube.dataio import I3FileStagerFile
@@ -23,8 +22,9 @@ if has_icecube_package():
 class I3Reader(GraphNeTFileReader):
     """A class for reading .i3 files from the IceCube Neutrino Observatory.
 
-    Note that this class relies on IceCube-specific software, and therefore
-    must be run in a software environment that contains IceTray.
+    Note that this class relies on IceCube-specific software, and
+    therefore must be run in a software environment that contains
+    IceTray.
     """
 
     def __init__(

@@ -63,6 +63,7 @@ class DatasetConfig(BaseConfig):
     data_representation: Any = None
     labels: Optional[Dict[str, Any]] = None
     use_super_selection: bool = False
+    augmentations: Optional[List[Any]] = None
 
     def __init__(self, **data: Any) -> None:
         """Construct `DataConfig`.
@@ -168,9 +169,9 @@ class DatasetConfig(BaseConfig):
     def as_dict(self) -> Dict[str, Dict[str, Any]]:
         """Represent ModelConfig as a dict.
 
-        This builds on `BaseModel.dict()` but wraps the output in a single-key
-        dictionary to make it unambiguous to identify model arguments that are
-        themselves models.
+        This builds on `BaseModel.dict()` but wraps the output in a
+        single-key dictionary to make it unambiguous to identify model
+        arguments that are themselves models.
         """
         config_dict = self.dict()
         config_dict = traverse_and_apply(
@@ -196,7 +197,7 @@ def save_dataset_config(init_fn: Callable) -> Callable:
     )
 
     def _replace_model_instance_with_config(
-        obj: Union["Model", Any]
+        obj: Union["Model", Any],
     ) -> Union[ModelConfig, Any]:
         """Replace `Model` instances in `obj` with their `ModelConfig`."""
         from graphnet.models import Model
@@ -237,7 +238,7 @@ class DatasetConfigSaverMeta(type):
         """Catch object after construction and save config."""
 
         def _replace_model_instance_with_config(
-            obj: Union["Model", Any]
+            obj: Union["Model", Any],
         ) -> Union[ModelConfig, Any]:
             """Replace `Model` instances in `obj` with their `ModelConfig`."""
             from graphnet.models import Model

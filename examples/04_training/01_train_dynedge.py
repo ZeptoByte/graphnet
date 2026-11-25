@@ -12,7 +12,7 @@ from graphnet.data.constants import FEATURES, TRUTH
 from graphnet.models import StandardModel
 from graphnet.models.detector.prometheus import Prometheus
 from graphnet.models.gnn import DynEdge
-from graphnet.models.graphs import KNNGraph
+from graphnet.models.data_representation import KNNGraph
 from graphnet.models.task.reconstruction import EnergyReconstruction
 from graphnet.training.callbacks import PiecewiseLinearLR
 from graphnet.training.loss_functions import LogCoshLoss
@@ -24,7 +24,7 @@ from graphnet.data.dataset import ParquetDataset
 
 # Constants
 features = FEATURES.PROMETHEUS
-truth = TRUTH.PROMETHEUS
+truth = TRUTH.PROMETHEUS_LEGACY
 
 
 def main(
@@ -187,11 +187,6 @@ def main(
     # Save results as .csv
     results.to_csv(f"{path}/results.csv")
 
-    # Save full model (including weights) to .pth file - not version safe
-    # Note: Models saved as .pth files in one version of graphnet
-    #       may not be compatible with a different version of graphnet.
-    model.save(f"{path}/model.pth")
-
     # Save model config and state dict - Version safe save method.
     # This method of saving models is the safest way.
     model.save_state_dict(f"{path}/state_dict.pth")
@@ -201,11 +196,9 @@ def main(
 if __name__ == "__main__":
 
     # Parse command-line arguments
-    parser = ArgumentParser(
-        description="""
+    parser = ArgumentParser(description="""
 Train GNN model without the use of config files.
-"""
-    )
+""")
 
     parser.add_argument(
         "--path",
@@ -239,7 +232,7 @@ Train GNN model without the use of config files.
         ("max-epochs", 1),
         "early-stopping-patience",
         ("batch-size", 16),
-        "num-workers",
+        ("num-workers", 2),
     )
 
     parser.add_argument(

@@ -24,7 +24,7 @@ from graphnet.data.dataset import ParquetDataset
 
 # Constants
 features = FEATURES.PROMETHEUS
-truth = TRUTH.PROMETHEUS
+truth = TRUTH.PROMETHEUS_LEGACY
 
 
 def main(
@@ -174,7 +174,6 @@ def main(
 
     results.to_csv(f"{path}/results.csv")
 
-    model.save(f"{path}/model.pth")
     model.save_state_dict(f"{path}/state_dict.pth")
     model.save_config(f"{path}/model_config.yml")
 
@@ -182,11 +181,9 @@ def main(
 if __name__ == "__main__":
 
     # Parse command-line arguments
-    parser = ArgumentParser(
-        description="""
+    parser = ArgumentParser(description="""
 Train GNN model without the use of config files.
-"""
-    )
+""")
 
     parser.add_argument(
         "--path",
@@ -220,7 +217,7 @@ Train GNN model without the use of config files.
         ("max-epochs", 1),
         "early-stopping-patience",
         ("batch-size", 16),
-        "num-workers",
+        ("num-workers", 2),
     )
 
     parser.add_argument(

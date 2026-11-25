@@ -1,5 +1,7 @@
 """Reconstruction-specific `Model` class(es)."""
 
+from typing import Any
+
 import numpy as np
 import torch
 from torch import Tensor
@@ -51,12 +53,12 @@ class DirectionReconstruction(StandardLearnedTask):
 
     # Requires three features: untransformed points in (x,y,z)-space.
     default_target_labels = ["direction"]  # contains dir_x, dir_y, dir_z
+    # see Direction label in /src/graphnet/training/labels.py
     default_prediction_labels = ["dir_x_pred", "dir_y_pred", "dir_z_pred"]
     nb_inputs = 3
 
     def _forward(self, x: Tensor) -> Tensor:
-        x = (x.T / torch.linalg.vector_norm(x, dim=1)).T
-        return x
+        return x / torch.linalg.vector_norm(x, dim=1, keepdim=True)
 
 
 class DirectionReconstructionWithUncertainty(StandardLearnedTask):
@@ -102,30 +104,77 @@ class DirectionReconstructionWithKappa(StandardLearnedTask):
         "dir_z_pred",
         "direction_kappa",
     ]
-    nb_inputs = 3
 
-    def __init__(self, *args, scaling=False, sinh_scaling=False, **kwargs):
-        """Initialise DirectionReconstruction.
+    def __init__(
+        self,
+        *args: Any,
+        scaling: bool = False,
+        sinh_scaling: bool = False,
+        kappa_output: bool = False,
+        shape_output: bool = False,
+        **kwargs: Any,
+    ):
+        """Construct `DirectionReconstructionWithKappa`.
 
         Args:
-            scaling: Whether to apply scaling to kappa.
-            sinh_scaling: Whether to apply sinh scaling to kappa.
+            scaling: If True, the predicted magnitude `k` is mapped to
+                `k + k**2`, widening its dynamic range for losses (such as
+                `spCauchyLoss`) that derive a concentration from it.
+            sinh_scaling: If True, the (optionally `scaling`-mapped) kappa
+                is mapped to `sinh(min(k, 30))`.
+            kappa_output: If True, the concentration has an output of its
+                own: the task takes four inputs, the direction is the
+                normalized first three and `k = exp(fourth)`. Otherwise `k`
+                is the norm of the three direction inputs, which couples
+                the predicted confidence to the direction output.
+            shape_output: If True (requires `kappa_output`), a fifth output
+                gives a tail index `gamma = 1 + exp(fifth)` in
+                [1.1, 31], e.g. for `KingLoss`. A zero output gives
+                `gamma = 2`, the spherical Cauchy.
         """
-        self.scaling = scaling
-        self.sinh_scaling = sinh_scaling
+        assert not (
+            (scaling or sinh_scaling) and kappa_output
+        ), "`scaling` only applies to a kappa taken from the norm."
+        assert (
+            kappa_output or not shape_output
+        ), "`shape_output` requires `kappa_output`."
+        self._scaling = scaling
+        self._sinh_scaling = sinh_scaling
+        self._kappa_output = kappa_output
+        self._shape_output = shape_output
+        if shape_output:
+            self.default_prediction_labels = self.default_prediction_labels + [
+                "direction_gamma"
+            ]
         super().__init__(*args, **kwargs)
 
+    @property
+    def nb_inputs(self) -> int:
+        """Return number of inputs assumed by task."""
+        if self._kappa_output:
+            return 5 if self._shape_output else 4
+        return 3
+
     def _forward(self, x: Tensor) -> Tensor:
+        if self._kappa_output:
+            direction = torch.nn.functional.normalize(x[:, :3], dim=1)
+            kappa = torch.exp(x[:, 3].clamp(min=-20.0, max=20.0))
+            outputs = [direction, kappa.unsqueeze(1)]
+            if self._shape_output:
+                # gamma - 1 in [0.1, 30]
+                gamma = 1 + torch.exp(
+                    x[:, 4].clamp(min=np.log(0.1), max=np.log(30.0))
+                )
+                outputs.append(gamma.unsqueeze(1))
+            return torch.cat(outputs, dim=1)
         # Transform outputs to angle and prepare prediction
         kappa = torch.linalg.vector_norm(x, dim=1) + eps_like(x)
-
         vec_x = x[:, 0] / kappa
         vec_y = x[:, 1] / kappa
         vec_z = x[:, 2] / kappa
-
-        if self.scaling:
-            kappa = kappa+kappa**2#torch.sinh(torch.clamp(kappa, max=15.0))
-        if self.sinh_scaling:
+        if self._scaling:
+            kappa = kappa + kappa**2
+        if self._sinh_scaling:
             kappa = torch.sinh(torch.clamp(kappa, max=30.0))
         return torch.stack((vec_x, vec_y, vec_z, kappa), dim=1)
 
@@ -218,10 +267,8 @@ class EnergyReconstructionWithUncertainty(EnergyReconstruction):
     def _forward(self, x: Tensor) -> Tensor:
         # Transform energy
         energy = super()._forward(x[:, :1]).squeeze(1)
-        # Transform uncertainty
-        # Use softplus to ensure positive uncertainty
-        sigma = torch.nn.functional.softplus(x[:, 1], beta=0.1)
-        pred = torch.stack((energy, sigma), dim=1)
+        log_var = x[:, 1]
+        pred = torch.stack((energy, log_var), dim=1)
         return pred
 
 

@@ -2,12 +2,12 @@
 
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 from typing import Any, Optional, List, Callable, Dict, Sequence, Union
 
 import numpy as np
 import pandas as pd
 import sqlite3
-
 from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import gaussian_filter1d
 from scipy.special import expit
@@ -56,8 +56,8 @@ def _save_table_checked(
 class WeightFitter(ABC, Logger):
     """Produces per-event weights.
 
-    Weights are returned by the public method `fit_weights()`, and the weights
-    can be saved as a table in the database.
+    Weights are returned by the public method `fit_weights()`, and the
+    weights can be saved as a table in the database.
     """
 
     def __init__(
@@ -239,10 +239,6 @@ class Uniform(WeightFitter):
         truth[self._weight_name] = sample_weights
         return truth.sort_values("event_no").reset_index(drop=True)
 
-    def _gather_stats(self, truth: pd.DataFrame) -> pd.DataFrame:
-        """Gather statistics about multiple databases in order to fit
-        weights."""
-
     def _generate_weight_name(self) -> str:
         return self._variable + "_uniform_weight"
 
@@ -301,8 +297,8 @@ class Uniform(WeightFitter):
 class BjoernLow(WeightFitter):
     """Produces per-event weights.
 
-    Events below x_low are weighted to be uniform, whereas events above x_low
-    are weighted to follow a 1/(1+a*(x_low -x)) curve.
+    Events below x_low are weighted to be uniform, whereas events above
+    x_low are weighted to follow a 1/(1+a*(x_low -x)) curve.
     """
 
     def _fit_weights(  # type: ignore[override]
@@ -381,8 +377,8 @@ class BjoernLow(WeightFitter):
 class PooledSplineCDFWeighter(Logger):
     """Fit event-by-event weights using a smoothed histogram/CDF spline in 1D.
 
-    This class is intended for the log-space-uniform case where you want a
-    smooth, monotone density estimate without KDE overhead.
+    This class is intended for the log-space-uniform case where you want
+    a smooth, monotone density estimate without KDE overhead.
     """
 
     def __init__(
@@ -391,6 +387,13 @@ class PooledSplineCDFWeighter(Logger):
         truth_table: str = "truth",
         index_column: str = "event_no",
     ):
+        """Construct `PooledSplineCDFWeighter`.
+
+        Args:
+            database_paths: SQLite databases whose events are pooled.
+            truth_table: Table holding the variables to weigh in.
+            index_column: Event index column.
+        """
         super().__init__(name=__name__, class_name=self.__class__.__name__)
         self._database_paths = list(database_paths)
         self._truth_table = truth_table
@@ -645,6 +648,86 @@ class PooledSplineCDFWeighter(Logger):
         weights[valid_ix] = valid_weights
         return weights
 
+    def _fitted_features(self) -> List[str]:
+        if self._features is None:
+            raise RuntimeError("Call fit() before apply().")
+        return self._features
+
+    def _raw_weights(
+        self,
+        database_path: str,
+        weight_suffix: str,
+        suppress_outliers: bool,
+        taper_width: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the index, features and unscaled weights of a database."""
+        features = self._fitted_features()
+        try:
+            df = self._read_truth(database_path, features)
+        except Exception as exc:
+            print(
+                f"WARNING: Failed to apply weights to {database_path}: {exc}",
+                flush=True,
+            )
+            return None
+        out: Dict[str, Any] = {
+            self._index_column: df[self._index_column].to_numpy(),
+        }
+        for feature in features:
+            out[feature] = df[feature].to_numpy()
+        for feature in features:
+            out[f"{feature}{weight_suffix}"] = self._compute_weights(
+                df[feature].to_numpy(dtype=float),
+                feature,
+                suppress_outliers=suppress_outliers,
+                taper_width=taper_width,
+            )
+        return out
+
+    def _all_raw_weights(
+        self,
+        weight_suffix: str,
+        suppress_outliers: bool,
+        taper_width: float,
+        n_jobs: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Compute unscaled weights for all databases, optionally threaded."""
+        raw_weights = partial(
+            self._raw_weights,
+            weight_suffix=weight_suffix,
+            suppress_outliers=suppress_outliers,
+            taper_width=taper_width,
+        )
+        results: Dict[str, Dict[str, Any]] = {}
+        if n_jobs == 1:
+            for db in tqdm(
+                self._database_paths,
+                desc="  Computing raw weights",
+                leave=False,
+            ):
+                out = raw_weights(db)
+                if out is not None:
+                    results[db] = out
+            return results
+
+        print(f"  Parallel preprocessing with {n_jobs} jobs...", flush=True)
+        max_workers = None if n_jobs == -1 else n_jobs
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(raw_weights, db): db
+                for db in self._database_paths
+            }
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="  Computing raw weights",
+                leave=False,
+            ):
+                out = future.result()
+                if out is not None:
+                    results[futures[future]] = out
+        return results
+
     def apply(
         self,
         target_total_weight: float,
@@ -655,131 +738,73 @@ class PooledSplineCDFWeighter(Logger):
         force: bool = False,
         n_jobs: int = 1,
     ) -> Dict[str, pd.DataFrame]:
-        if self._features is None:
-            raise RuntimeError("Call fit() before apply().")
+        """Compute weights for every database.
 
+        Args:
+            target_total_weight: Total weight, summed over all databases,
+                that the weights of each feature are scaled to.
+            suppress_outliers: Taper the weights outside the fitted
+                percentile range.
+            taper_width: Width of the taper (in transformed units).
+            weight_suffix: Suffix appended to the feature name to name the
+                weight column (and table).
+            deploy: If True, write each feature's weights to a table
+                `<feature><weight_suffix>` in each database.
+            force: If True, overwrite existing weight tables when deploying.
+            n_jobs: Number of threads for reading databases (-1 for all).
+
+        Returns:
+            Per database, a DataFrame with the index, the features and their
+            weights.
+        """
+        features = self._fitted_features()
         print(
             f"Applying weights to {len(self._database_paths)} databases...",
             flush=True,
         )
+        raw_results = self._all_raw_weights(
+            weight_suffix, suppress_outliers, taper_width, n_jobs
+        )
 
-        raw_results: Dict[str, Dict[str, Any]] = {}
-        raw_weight_sums = {feature: [] for feature in self._features}
-
-        def _compute_raw_result(db: str) -> tuple:
-            try:
-                df = self._read_truth(db, self._features)
-                out_dict: Dict[str, Any] = {
-                    self._index_column: df[self._index_column].to_numpy(),
-                }
-                for feature in self._features:
-                    out_dict[feature] = df[feature].to_numpy()
-                for feature in self._features:
-                    x = df[feature].to_numpy(dtype=float)
-                    w = self._compute_weights(
-                        x,
-                        feature,
-                        suppress_outliers=suppress_outliers,
-                        taper_width=taper_width,
-                    )
-                    out_dict[f"{feature}{weight_suffix}"] = w
-                return db, out_dict
-            except Exception as exc:
-                print(
-                    f"WARNING: Failed to apply weights to {db}: {exc}",
-                    flush=True,
+        total_raw_weight = np.mean(
+            [
+                sum(
+                    out[f"{feature}{weight_suffix}"].sum()
+                    for out in raw_results.values()
                 )
-                return db, None
-
-        if n_jobs == 1:
-            iterator = tqdm(
-                self._database_paths,
-                desc="  Computing raw weights",
-                leave=False,
-            )
-            results = (_compute_raw_result(db) for db in iterator)
-            for db, out_dict in results:
-                if out_dict is None:
-                    continue
-                raw_results[db] = out_dict
-                for feature in self._features:
-                    raw_weight_sums[feature].append(
-                        np.array(
-                            [out_dict[f"{feature}{weight_suffix}"].sum()],
-                            dtype=float,
-                        )
-                    )
-        else:
-            print(
-                f"  Parallel preprocessing with {n_jobs} jobs...", flush=True
-            )
-            max_workers = None if n_jobs == -1 else n_jobs
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(_compute_raw_result, db)
-                    for db in self._database_paths
-                ]
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc="  Computing raw weights",
-                    leave=False,
-                ):
-                    db, out_dict = future.result()
-                    if out_dict is None:
-                        continue
-                    raw_results[db] = out_dict
-                    for feature in self._features:
-                        raw_weight_sums[feature].append(
-                            np.array(
-                                [out_dict[f"{feature}{weight_suffix}"].sum()],
-                                dtype=float,
-                            )
-                        )
-
-        global_weights = {}
-        for feature in self._features:
-            if raw_weight_sums[feature]:
-                global_weights[feature] = np.concatenate(
-                    raw_weight_sums[feature]
-                )
-
-        total_raw_weight = np.mean([w.sum() for w in global_weights.values()])
+                for feature in features
+            ]
+        )
         scale_factor = target_total_weight / total_raw_weight
         print(f"Weight scale factor: {scale_factor:.6f}", flush=True)
 
-        out: Dict[str, pd.DataFrame] = {}
+        results: Dict[str, pd.DataFrame] = {}
         for db, out_dict in raw_results.items():
-            for feature in self._features:
-                weight_name = f"{feature}{weight_suffix}"
-                out_dict[weight_name] = out_dict[weight_name] * scale_factor
-
+            for feature in features:
+                out_dict[f"{feature}{weight_suffix}"] *= scale_factor
             wdf = (
                 pd.DataFrame(out_dict)
                 .sort_values(self._index_column)
                 .reset_index(drop=True)
             )
-
             if deploy:
-                for feature in self._features:
+                for feature in features:
                     weight_name = f"{feature}{weight_suffix}"
-                    deploy_df = wdf[[self._index_column, weight_name]]
                     _save_table_checked(
-                        deploy_df,
+                        wdf[[self._index_column, weight_name]],
                         weight_name,
                         db,
                         force=force,
                     )
-
-            out[db] = wdf
+            results[db] = wdf
 
         print("Weight application summary:", flush=True)
-        for feature in self._features:
+        for feature in features:
             total_weight = sum(
-                out[db][f"{feature}{weight_suffix}"].sum() for db in out.keys()
+                df[f"{feature}{weight_suffix}"].sum()
+                for df in results.values()
             )
             print(
                 f"  {feature}: total weight = {total_weight:.1f}", flush=True
             )
-
-        return out
+        return results

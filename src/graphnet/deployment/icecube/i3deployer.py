@@ -61,10 +61,11 @@ class I3Deployer(Deployer):
     ) -> None:
         """Will start an IceTray read/write chain with graphnet modules.
 
-        If n_workers > 1, this function is run in parallel n_worker times. Each
-        worker will loop over an allocated set of i3 files. The new i3 files
-        will appear as copies of the original i3 files but with reconstructions
-        added. Original i3 files are left untouched.
+        If n_workers > 1, this function is run in parallel n_worker
+        times. Each worker will loop over an allocated set of i3 files.
+        The new i3 files will appear as copies of the original i3 files
+        but with reconstructions added. Original i3 files are left
+        untouched.
         """
         if isinstance(settings.gcd_file, str):
             settings.gcd_file = [settings.gcd_file] * len(settings.i3_files)

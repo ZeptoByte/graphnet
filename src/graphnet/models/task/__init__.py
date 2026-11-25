@@ -3,7 +3,8 @@
 from .task import (
     Task,
     IdentityTask,
+    IdentityTaskWithUncertainty,
     StandardLearnedTask,
     StandardFlowTask,
 )
-from .multitask_utils import LossWeightBalancing
+from .heads import TaskHead, MLPHead

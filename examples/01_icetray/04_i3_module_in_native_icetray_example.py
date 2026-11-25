@@ -46,7 +46,7 @@ def apply_to_files(
 ) -> None:
     """Will start an IceTray read/write chain with graphnet modules.
 
-    The new i3 files will appear as copies of the original i3 files but with
+    The new i3 files will appear as copies of the original i3 files with
     reconstructions added. Original i3 files are left untouched.
     """
     for i3_file in i3_files:
@@ -124,11 +124,9 @@ if __name__ == "__main__":
 
     else:
         # Parse command-line arguments
-        parser = ArgumentParser(
-            description="""
+        parser = ArgumentParser(description="""
 Use GraphNeTI3Modules to deploy trained model in native IceTray.
-"""
-        )
+""")
 
         args, unknown = parser.parse_known_args()
 

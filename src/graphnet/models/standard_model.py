@@ -1,28 +1,28 @@
 """Standard model class(es)."""
 
-from typing import Dict, List, Optional, Union, Type
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union, Type
 import torch
 from torch import Tensor
 from torch_geometric.data import Data
 from torch.optim import Adam
-from itertools import chain
 
 from graphnet.models.gnn.gnn import GNN
 from graphnet.models import Model
 from .easy_model import EasySyntax
 from graphnet.models.task import StandardLearnedTask
+from graphnet.models.task.loss_balancing import LossBalancing
 from graphnet.models.data_representation import (
     GraphDefinition,
     DataRepresentation,
 )
-from graphnet.models.task.multitask_utils import LossWeightBalancing
 
 
 class StandardModel(EasySyntax):
     """A Standard way of combining model components in GraphNeT.
 
-    This model is compatible with the vast majority of supervised learning
-    tasks such as regression, binary and multi-label classification.
+    This model is compatible with the vast majority of supervised
+    learning tasks such as regression, binary and multi-label
+    classification.
 
     Capable of producing both event-level and pulse-level predictions.
     """
@@ -40,10 +40,39 @@ class StandardModel(EasySyntax):
         scheduler_class: Optional[type] = None,
         scheduler_kwargs: Optional[Dict] = None,
         scheduler_config: Optional[Dict] = None,
-        learned_multitask_weights: int = -1,
-        verbose_loss: bool = False,
+        loss_balancing: Optional[LossBalancing] = None,
+        exclude_from_weight_decay: bool = False,
     ) -> None:
-        """Construct `StandardModel`."""
+        """Construct `StandardModel`.
+
+        Args:
+            tasks: Task(s) predicted from the backbone output.
+            data_representation: Representation turning input data into
+                model input.
+            graph_definition: Deprecated alias of `data_representation`.
+            backbone: Model producing the latent output fed to the tasks.
+            gnn: Deprecated alias of `backbone`.
+            split: Optional routing of the backbone output to the tasks, as
+                `[sizes, indices]`. The output is split along the last
+                dimension into chunks of `sizes`; `indices[i]` selects the
+                input of task `i` as either a chunk index, a list of chunk
+                indices (concatenated), or a pair `[own, shared]` where the
+                `shared` chunks are concatenated after the `own` chunk(s)
+                with gradients detached (`own` may be `None`).
+            optimizer_class: Optimizer class used during training.
+            optimizer_kwargs: Keyword arguments passed to `optimizer_class`.
+            scheduler_class: Learning-rate scheduler class.
+            scheduler_kwargs: Keyword arguments passed to `scheduler_class`.
+            scheduler_config: Lightning scheduler configuration.
+            loss_balancing: Optional `LossBalancing` combining the task
+                losses (e.g. `UncertaintyWeighting`). Its parameters get
+                their own optimizer parameter group without weight decay.
+            exclude_from_weight_decay: If True, biases, normalization
+                layers, the parameters listed by the backbone's
+                `no_weight_decay()` and the parameters of the loss functions
+                are not weight-decayed (relevant for optimizers with
+                decoupled weight decay such as AdamW).
+        """
         # Base class constructor
         super().__init__(
             tasks=tasks,
@@ -94,31 +123,42 @@ class StandardModel(EasySyntax):
         # Member variable(s)
         self._data_representation = data_representation
         self.backbone = backbone
-        self._split_sizes = None
 
+        self._split_sizes: Optional[List[int]] = None
+        self._split_indices: List = []
         if split is not None:
-            self._split_sizes = split[0]
-            self._split_indices = split[1]
-            max_index = max(self.flatten_split_indices(self._split_indices))
-            assert len(self._split_sizes) == (max_index + 1)
+            self._split_sizes, self._split_indices = split[0], split[1]
+            assert len(self._split_indices) == len(
+                self._tasks
+            ), "`split` must provide one index entry per task."
+            assert len(self._split_sizes) == (
+                max(self._flatten_split_indices(self._split_indices)) + 1
+            ), "`split` sizes and indices are inconsistent."
+            assert sum(self._split_sizes) == self.backbone.nb_outputs, (
+                "`split` sizes do not add up to the backbone output"
+                " dimension."
+            )
 
-            assert (
-                sum(self._split_sizes) == self.backbone.nb_outputs
-            ), "Split dimensions do not match backbone output dimension check your configuration"
+        self._exclude_from_weight_decay = exclude_from_weight_decay
+        self.loss_balancing = loss_balancing
+        if self.loss_balancing is not None:
+            self.loss_balancing.setup(self._tasks, self._detached_tasks())
 
-            if learned_multitask_weights != -1:
-                assert isinstance(tasks, list)
-                # init the module for learned task weights
-                self.loss_weight_balancing = LossWeightBalancing(
-                    tasks, late_activation=learned_multitask_weights
-                )
-            else:
-                self.loss_weight_balancing = None
+    def _detached_tasks(self) -> List[bool]:
+        """Return whether each task's input is detached from the backbone."""
+        detached = [task._detach_backbone for task in self._tasks]
+        for i, indices in enumerate(self._split_indices):
+            if (
+                isinstance(indices, list)
+                and len(indices) == 2
+                and indices[0] is None
+                and isinstance(indices[1], list)
+            ):
+                detached[i] = True
+        return detached
 
-    def compute_loss(
-        self, preds: Tensor, data: List[Data], verbose: bool = False
-    ) -> tuple[Tensor, Tensor]:
-        """Compute and sum losses across tasks."""
+    def _task_losses(self, preds: Tensor, data: List[Data]) -> List[Tensor]:
+        """Return the (unbalanced) loss of each task."""
         data_merged = {}
         target_labels_merged = list(set(self.target_labels))
         for label in target_labels_merged:
@@ -128,24 +168,31 @@ class StandardModel(EasySyntax):
                 data_merged[task._loss_weight] = torch.cat(
                     [d[task._loss_weight] for d in data], dim=0
                 )
-        # check that there are no nans or infs in the prediction
+            for attribute in task.reference_attributes:
+                data_merged[attribute] = torch.cat(
+                    [d[attribute].reshape(-1) for d in data], dim=0
+                )
 
-        losses = [
+        return [
             task.compute_loss(pred, data_merged)
             for task, pred in zip(self._tasks, preds)
         ]
 
-        if self.loss_weight_balancing is not None:
-            losses = self.loss_weight_balancing(losses)
+    def compute_loss(
+        self, preds: Tensor, data: List[Data], verbose: bool = False
+    ) -> Tensor:
+        """Compute and sum losses across tasks."""
+        losses = self._task_losses(preds, data)
+        # Unbalanced task losses, e.g. for balancers updating after a step
+        self._last_task_losses = torch.stack(
+            [loss.detach() for loss in losses]
+        )
 
-        if self.training == False:
-            # during validation we would like to inspect the individual losses for each task, so we log them separately
-            assert len(losses) == len(
-                self._tasks
-            ), f"Rank {self.global_rank}: expected {len(self._tasks)} losses, got {len(losses)}"
+        if not self.training:
+            # Log the individual (unbalanced) task losses during validation.
             for i, loss in enumerate(losses):
                 self.log(
-                    "i_loss" + "_" + str(i),
+                    f"i_loss_{i}",
                     loss,
                     prog_bar=False,
                     logger=True,
@@ -154,14 +201,41 @@ class StandardModel(EasySyntax):
                     batch_size=len(preds[0]),
                     sync_dist=True,
                 )
+            # ... and what the loss functions report, e.g. learned scales.
+            for i, task in enumerate(self._tasks):
+                monitored = task._loss_function.monitored_values()
+                for name, value in monitored.items():
+                    self.log(
+                        f"i_loss_{i}_{name}",
+                        value,
+                        on_step=False,
+                        on_epoch=True,
+                        batch_size=len(preds[0]),
+                        sync_dist=True,
+                    )
+            if self.loss_balancing is not None:
+                weights = self.loss_balancing.weights()
+                if weights is not None:
+                    tasks = self.loss_balancing.balanced_tasks
+                    for i, weight in zip(tasks, weights):
+                        self.log(
+                            f"loss_weight_{i}",
+                            weight,
+                            on_step=False,
+                            on_epoch=True,
+                            batch_size=len(preds[0]),
+                            sync_dist=True,
+                        )
+
+        if self.loss_balancing is not None:
+            losses = self.loss_balancing(losses, self.current_epoch)
 
         if verbose:
             self.info(f"{losses}")
         assert all(
             loss.dim() == 0 for loss in losses
         ), "Please reduce loss for each task separately"
-        loss_stack = torch.stack(losses)
-        return torch.sum(loss_stack), loss_stack
+        return torch.sum(torch.stack(losses))
 
     def forward(
         self, data: Union[Data, List[Data]]
@@ -174,62 +248,143 @@ class StandardModel(EasySyntax):
             x = self.backbone(d)
             x_list.append(x)
         x = torch.cat(x_list, dim=0)
-        if self._split_sizes is not None:
-            x = x.split(list(self._split_sizes), dim=-1)
-            preds = []
-            for indc, task in zip(self._split_indices, self._tasks):
-                if isinstance(indc, int):
-                    x_set = x[indc]
-                elif isinstance(indc, list):
-                    if all(isinstance(i, int) for i in indc):
-                        x_set = torch.concat([x[i] for i in indc], dim=-1)
-                    else:
-                        assert (
-                            len(indc) == 2
-                        ), "If indc is a list it must be of length 2, the first being the task-specific indices and the second being the shared indices which are to be detached from the backbone output"
-                        task_specific_indices = indc[0]
 
-                        if isinstance(task_specific_indices, (int)):
-                            task_specific_indices = [task_specific_indices]
-
-                        shared_indices = indc[1]
-                        if isinstance(task_specific_indices, type(None)):
-                            x_set = torch.concat(
-                                [x[i] for i in indc[1]], dim=-1
-                            ).detach()
-                        else:
-                            x_set = torch.concat(
-                                [
-                                    torch.concat(
-                                        [x[i] for i in task_specific_indices],
-                                        dim=-1,
-                                    ),
-                                    torch.concat(
-                                        [x[i] for i in shared_indices], dim=-1
-                                    ).detach(),
-                                ],
-                                dim=-1,
-                            )
-                else:
-                    raise TypeError(
-                        f"expected indc in self._split_indices of type int or list but got {type(indc)}"
-                    )
-                preds.append(task(x_set))
-        else:
+        if self._split_sizes is None:
             preds = [task(x) for task in self._tasks]
-        return preds
+        else:
+            chunks = x.split(list(self._split_sizes), dim=-1)
+            preds = [
+                task(self._route(chunks, indices))
+                for indices, task in zip(self._split_indices, self._tasks)
+            ]
+        # inference: relative predictions back to absolute (`reference_labels`)
+        return [
+            task.add_references(pred, data)
+            for task, pred in zip(self._tasks, preds)
+        ]
 
-    def shared_step(
-        self, batch: List[Data], batch_idx: int
-    ) -> tuple[Tensor, Tensor]:
+    @staticmethod
+    def _route(
+        chunks: Tuple[Tensor, ...], indices: Union[int, List]
+    ) -> Tensor:
+        """Assemble one task's input from the split backbone output."""
+        if isinstance(indices, int):
+            return chunks[indices]
+        if not isinstance(indices, list):
+            raise TypeError(
+                "Expected `split` indices of type int or list, got"
+                f" {type(indices)}."
+            )
+        if all(isinstance(i, int) for i in indices):
+            return torch.cat([chunks[i] for i in indices], dim=-1)
+
+        assert len(indices) == 2, (
+            "A nested `split` entry must be `[own, shared]`, with the"
+            " `shared` chunks detached from the backbone."
+        )
+        own, shared = indices
+        detached = torch.cat([chunks[i] for i in shared], dim=-1).detach()
+        if own is None:
+            return detached
+        if isinstance(own, int):
+            own = [own]
+        return torch.cat(
+            [torch.cat([chunks[i] for i in own], dim=-1), detached], dim=-1
+        )
+
+    @classmethod
+    def _flatten_split_indices(cls, nested: List) -> Iterator[int]:
+        for item in nested:
+            if isinstance(item, list):
+                yield from cls._flatten_split_indices(item)
+            elif item is not None:
+                yield item
+
+    def shared_step(self, batch: List[Data], batch_idx: int) -> Tensor:
         """Perform shared step.
 
-        Applies the forward pass and the following loss calculation, shared
-        between the training and validation step.
+        Applies the forward pass and the following loss calculation,
+        shared between the training and validation step.
         """
         preds = self(batch)
-        loss, loss_stack = self.compute_loss(preds, batch)
-        return loss, loss_stack
+        loss = self.compute_loss(preds, batch)
+        return loss
+
+    def on_train_batch_end(
+        self, outputs: Any, batch: Any, batch_idx: int
+    ) -> None:
+        """Let the loss balancing update after the optimizer step."""
+        if self.loss_balancing is not None:
+            self.loss_balancing.on_train_batch_end(self, batch)
+
+    def _no_decay_parameter_ids(self) -> Set[int]:
+        """Return ids of parameters that should not be weight-decayed.
+
+        Biases, normalization layers, the backbone's `no_weight_decay()`
+        parameters and the parameters of the loss functions (e.g.
+        learned scales).
+        """
+        ids: Set[int] = set()
+        for task in self._tasks:
+            ids.update(id(p) for p in task._loss_function.parameters())
+        norm_types = (
+            torch.nn.LayerNorm,
+            torch.nn.modules.batchnorm._BatchNorm,
+            torch.nn.GroupNorm,
+        )
+        for module in self.modules():
+            if isinstance(module, norm_types):
+                ids.update(id(p) for p in module.parameters())
+        for name, param in self.named_parameters():
+            if name.endswith(".bias"):
+                ids.add(id(param))
+        if hasattr(self.backbone, "no_weight_decay"):
+            listed = set(self.backbone.no_weight_decay())
+            for name, param in self.backbone.named_parameters():
+                if name.split(".")[0] in listed or name in listed:
+                    ids.add(id(param))
+        return ids
+
+    def _optimizer_parameters(self) -> Union[Iterator, List[Dict]]:
+        """Return the parameter groups passed to the optimizer.
+
+        The loss-balancing parameters form their own group with the options
+        of `LossBalancing.param_group_options` (no weight decay, lr scale).
+        With `exclude_from_weight_decay`, biases, normalization layers and
+        the backbone's `no_weight_decay()` parameters form a group without
+        weight decay.
+        """
+        balancing: List[torch.nn.Parameter] = []
+        if self.loss_balancing is not None:
+            balancing = list(self.loss_balancing.parameters())
+        if not balancing and not self._exclude_from_weight_decay:
+            return super()._optimizer_parameters()
+
+        balancing_ids = {id(p) for p in balancing}
+        no_decay_ids = (
+            self._no_decay_parameter_ids()
+            if self._exclude_from_weight_decay
+            else set()
+        )
+        decay: List[torch.nn.Parameter] = []
+        no_decay: List[torch.nn.Parameter] = []
+        for param in self.parameters():
+            if id(param) in balancing_ids:
+                continue
+            (no_decay if id(param) in no_decay_ids else decay).append(param)
+
+        groups: List[Dict] = [{"params": decay}]
+        if no_decay:
+            groups.append({"params": no_decay, "weight_decay": 0.0})
+        if balancing:
+            assert self.loss_balancing is not None
+            groups.append(
+                {
+                    "params": balancing,
+                    **self.loss_balancing.param_group_options,
+                }
+            )
+        return groups
 
     def validate_tasks(self) -> None:
         """Verify that self._tasks contain compatible elements."""
@@ -247,10 +402,3 @@ class StandardModel(EasySyntax):
             " GraphNeT 2.0. Please use `_data_representation` instead."
         )
         return self._data_representation
-
-    def flatten_split_indices(self, nested):
-        for item in nested:
-            if isinstance(item, list):
-                yield from self.flatten_split_indices(item)
-            elif item is not None:
-                yield item

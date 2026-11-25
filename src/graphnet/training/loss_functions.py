@@ -5,14 +5,14 @@ handles per-event weights, etc.
 """
 
 from abc import abstractmethod
-from typing import Any, Optional, Union, List, Dict
+from typing import Any, Optional, Union, List, Dict, Sequence, Tuple
 
 import numpy as np
 import scipy.special
+import scipy.stats
 import torch
 from torch import Tensor
 from torch import nn
-from torch.distributions import Beta
 from torch.nn.functional import (
     one_hot,
     binary_cross_entropy,
@@ -30,6 +30,29 @@ class LossFunction(Model):
     def __init__(self, **kwargs: Any) -> None:
         """Construct `LossFunction`, saving model config."""
         super().__init__(**kwargs)
+
+    @property
+    def lower_bound(self) -> Optional[float]:
+        """Return a lower bound of the (unweighted, averaged) loss, if known.
+
+        The bound is the value the loss cannot go below for any prediction
+        and target, e.g. 0 for squared errors. It is used to measure how far
+        a task is from its best possible loss, e.g. for balancing several
+        losses. `None` means that no finite bound is known, as for
+        likelihoods with a predicted concentration or width, which can
+        become arbitrarily confident.
+
+        NOTE: With per-event `weights`, the bound scales with the mean
+        weight.
+        """
+        return None
+
+    def monitored_values(self) -> Dict[str, float]:
+        """Return quantities of the loss worth logging during training.
+
+        E.g. the current value of a learned scale. Empty by default.
+        """
+        return {}
 
     @final
     def forward(  # type: ignore[override]
@@ -52,37 +75,13 @@ class LossFunction(Model):
             elementwise terms with shape [N,] (if `return_elements = True`).
         """
         elements = self._forward(prediction, target)
-
-        # Normalize to [N, F] so weighting is always elementwise per event.
-        if elements.dim() == 1:
-            elements = elements.unsqueeze(1)
-        elif elements.dim() != 2:
-            raise ValueError(
-                "`_forward` must return a tensor of shape [N] or [N, F]."
-            )
-
         if weights is not None:
-            if weights.dim() == 1:
-                weights = weights.unsqueeze(1)
-            elif weights.dim() != 2:
-                raise ValueError("`weights` must have shape [N] or [N, F].")
-
-            assert weights.size(0) == elements.size(
-                0
-            ), "`weights` must have the same batch dimension as loss terms."
-            assert weights.size(1) in [1, elements.size(1)], (
-                "`weights` second dimension must be 1 or match loss term "
-                "feature dimension."
-            )
             elements = elements * weights
-
         assert elements.size(dim=0) == target.size(
             dim=0
         ), "`_forward` should return elementwise loss terms."
 
-        if return_elements:
-            return elements.squeeze(1) if elements.size(1) == 1 else elements
-        return torch.mean(elements)
+        return elements if return_elements else torch.mean(elements)
 
     @abstractmethod
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
@@ -92,6 +91,11 @@ class LossFunction(Model):
 class MAELoss(LossFunction):
     """Mean absolute error loss."""
 
+    @property
+    def lower_bound(self) -> float:
+        """Return 0; the loss is non-negative."""
+        return 0.0
+
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
         """Implement loss calculation."""
         return torch.mean(torch.abs(prediction - target), dim=-1)
@@ -99,6 +103,11 @@ class MAELoss(LossFunction):
 
 class MSELoss(LossFunction):
     """Mean squared error loss."""
+
+    @property
+    def lower_bound(self) -> float:
+        """Return 0; the loss is non-negative."""
+        return 0.0
 
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
         """Implement loss calculation."""
@@ -112,19 +121,6 @@ class MSELoss(LossFunction):
         return elements
 
 
-class RMSEAdjustedLoss(LossFunction):
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-
-        assert prediction.dim() == 2
-        assert prediction.size() == target.size()
-
-        elements = torch.mean(
-            (prediction - target) ** 2 / ((1 + target) ** (0.5)), dim=-1
-        )
-        return elements
-
-
 class RMSELoss(MSELoss):
     """Root mean squared error loss."""
 
@@ -134,15 +130,6 @@ class RMSELoss(MSELoss):
         elements = super()._forward(prediction, target)
         elements = torch.sqrt(elements)
         return elements
-
-
-class PoissonLoss(LossFunction):
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-
-        loss_func = nn.PoissonNLLLoss(log_input=False, reduction="none")
-        test = loss_func(prediction.float(), target.float())
-        return test
 
 
 class LogCoshLoss(LossFunction):
@@ -159,6 +146,11 @@ class LogCoshLoss(LossFunction):
         See [https://github.com/keras-team/keras/blob/v2.6.0/keras/losses.py#L1580-L1617] # noqa: E501
         """
         return x + softplus(-2.0 * x) - np.log(2.0)
+
+    @property
+    def lower_bound(self) -> float:
+        """Return 0; the loss is non-negative."""
+        return 0.0
 
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
         """Implement loss calculation."""
@@ -178,11 +170,18 @@ class CrossEntropyLoss(LossFunction):
     def __init__(
         self,
         options: Union[int, List[Any], Dict[Any, int]],
-        ratio: float = 1,
+        ratio: Optional[float] = None,
         *args: Any,
         **kwargs: Any,
     ):
-        """Construct CrossEntropyLoss."""
+        """Construct CrossEntropyLoss.
+
+        Args:
+            options: The classes (see the class docstring).
+            ratio: Weight of the first class relative to the others. If
+                given (also 1), the class weights are part of the module's
+                state (`_loss.weight`), as in models trained with it.
+        """
         # Base class constructor
         super().__init__(*args, **kwargs)
 
@@ -206,9 +205,16 @@ class CrossEntropyLoss(LossFunction):
                 f"Class options of type {type(self._options)} not supported"
             )
 
-        self._loss = nn.CrossEntropyLoss(
-            weight=torch.Tensor([ratio, 1]), reduction="none"
-        )
+        weight = None
+        if ratio is not None:
+            weight = torch.ones(self._nb_classes)
+            weight[0] = ratio
+        self._loss = nn.CrossEntropyLoss(weight=weight, reduction="none")
+
+    @property
+    def lower_bound(self) -> float:
+        """Return 0; the loss is non-negative."""
+        return 0.0
 
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
         """Transform outputs to angle and prepare prediction."""
@@ -251,6 +257,1400 @@ class CrossEntropyLoss(LossFunction):
         )
 
         return self._loss(prediction.float(), target_one_hot.float())
+
+
+def _binary_entropy(q: float) -> float:
+    """Return the entropy (nats) of a Bernoulli variable with mean `q`."""
+    if q <= 0.0 or q >= 1.0:
+        return 0.0
+    return float(-q * np.log(q) - (1 - q) * np.log1p(-q))
+
+
+class BinaryCrossEntropyLoss(LossFunction):
+    """Compute binary cross entropy loss."""
+
+    def __init__(
+        self,
+        from_logits: bool = False,
+        label_smoothing: float = 0.0,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        """Construct BinaryCrossEntropyLoss.
+
+        Args:
+            from_logits: Whether the predictions are logits.
+                NOTE: If True, the predictions are expected to be raw scores
+                (i.e., not passed through a sigmoid function). If False, the
+                predictions are expected to be probabilities
+                (i.e., passed through a sigmoid function).
+            label_smoothing: Smoothing `eps` in [0, 1): the targets 0 / 1 are
+                replaced by `eps / 2` / `1 - eps / 2`. The loss is then
+                smallest at a finite logit, `log((2 - eps) / eps)`, so correct
+                predictions stop being pushed to ever larger logits.
+        """
+        assert (
+            0.0 <= label_smoothing < 1.0
+        ), "label_smoothing must be in [0, 1)."
+        super().__init__(*args, **kwargs)
+        self._from_logits = from_logits
+        self._label_smoothing = label_smoothing
+
+    @property
+    def lower_bound(self) -> float:
+        """Return the entropy of the smoothed targets (0 without smoothing).
+
+        A target `q` gives a cross entropy of at least `H(q)`, reached at
+        prediction `q`; both smoothed targets have `H(eps / 2)`.
+        """
+        return _binary_entropy(self._label_smoothing / 2)
+
+    def _smooth(self, target: Tensor) -> Tensor:
+        return target * (1 - self._label_smoothing) + self._label_smoothing / 2
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        target = self._smooth(target.float())
+        if self._from_logits:
+            return binary_cross_entropy_with_logits(
+                prediction.float(), target, reduction="none"
+            )
+        else:
+            return binary_cross_entropy(
+                prediction.float(), target, reduction="none"
+            )
+
+
+class FocalBinaryCrossEntropyLoss(BinaryCrossEntropyLoss):
+    """Compute the focal binary cross entropy loss.
+
+    Down-weights well-classified examples by a factor `(1 - p_t)**gamma`
+    and balances the two classes with `alpha`, following Lin et al.,
+    "Focal Loss for Dense Object Detection" (https://arxiv.org/abs/1708.02002).
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float = 0.25,
+        from_logits: bool = False,
+        label_smoothing: float = 0.0,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        """Construct FocalBinaryCrossEntropyLoss.
+
+        Args:
+            gamma: Focusing parameter. `gamma = 0` recovers the (alpha
+                weighted) binary cross entropy.
+            alpha: Weight of the positive class; the negative class is
+                weighted by `1 - alpha`.
+            from_logits: Whether the predictions are logits (raw scores)
+                rather than probabilities.
+            label_smoothing: Smoothing of the targets in the cross entropy,
+                see `BinaryCrossEntropyLoss`; `alpha` and the focusing term
+                use the hard labels.
+        """
+        super().__init__(from_logits, label_smoothing, *args, **kwargs)
+        self._gamma = gamma
+        self._alpha = alpha
+
+    @property
+    def lower_bound(self) -> float:
+        """Return a lower bound of the mean loss.
+
+        For `gamma = 0` each event's loss is at least `alpha_t * H(eps / 2)`,
+        so the mean is at least `min(alpha, 1 - alpha) * H(eps / 2)` (exact
+        for `alpha = 0.5`). For `gamma > 0` the bound is 0.
+        """
+        if self._gamma != 0:
+            return 0.0
+        return min(self._alpha, 1 - self._alpha) * super().lower_bound
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        # smoothed targets in the cross entropy, the hard labels in the class
+        # weight and the focusing term
+        bce = super()._forward(prediction, target)
+        probability = prediction.float()
+        if self._from_logits:
+            probability = torch.sigmoid(probability)
+        target = target.float()
+        alpha_t = self._alpha * target + (1 - self._alpha) * (1 - target)
+        p_t = probability * target + (1 - probability) * (1 - target)
+        return alpha_t * (1 - p_t) ** self._gamma * bce
+
+
+class LogCMK(torch.autograd.Function):
+    """MIT License.
+
+    Copyright (c) 2019 Max Ryabinin
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+    _____________________
+
+    From [https://github.com/mryab/vmf_loss/blob/master/losses.py] Modified to
+    use modified Bessel function instead of exponentially scaled ditto
+    (i.e. `.ive` -> `.iv`) as indicated in [1812.04616] in spite of suggestion
+    in Sec. 8.2 of this paper. The change has been validated through comparison
+    with exact calculations for `m=2` and `m=3` and found to yield the correct
+    results.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any, m: int, kappa: Tensor
+    ) -> Tensor:  # pylint: disable=invalid-name,arguments-differ
+        """Forward pass."""
+        dtype = kappa.dtype
+        ctx.save_for_backward(kappa)
+        ctx.m = m
+        ctx.dtype = dtype
+        kappa = kappa.double()
+        iv = torch.from_numpy(
+            scipy.special.iv(m / 2.0 - 1, kappa.cpu().numpy())
+        ).to(kappa.device)
+        return (
+            (m / 2.0 - 1) * torch.log(kappa)
+            - torch.log(iv)
+            - (m / 2) * np.log(2 * np.pi)
+        ).type(dtype)
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_output: Tensor
+    ) -> Tensor:  # pylint: disable=invalid-name,arguments-differ
+        """Backward pass for LogCMK computation.
+
+        Mathematical Background:
+        -----------------------
+        For the von Mises-Fisher distribution, the gradient of log C_m(κ) with
+        respect to κ is given by the ratio of modified Bessel functions:
+
+        ∂/∂κ log C_m(κ) = (m/2-1)/κ - I_{m/2}(κ)/I_{m/2-1}(κ)
+
+        For m=3, this simplifies to the exact formula:
+        ∂/∂κ log C_3(κ) = 1/κ - 1/tanh(κ)
+
+        For small κ values, we use the Taylor series approximation:
+        f(κ) = -κ/3 + κ³/45 - 2κ⁵/945 + O(κ⁷)
+
+        The first-order approximation -κ/3 provides sufficient accuracy for
+        |κ| < 1e-6, with truncation error bounded by |κ|³/45 ≲ O(10⁻²¹).
+
+        Implementation Details:
+        ----------------------
+        Uses boolean masking to avoid double evaluation and RuntimeWarnings:
+        - Small κ: |κ| < 1e-6 → gradient = -κ/3 (Taylor approximation)
+        - Large κ: |κ| ≥ 1e-6 → gradient = 1/κ - 1/tanh(κ) (exact formula)
+
+        References:
+        ----------
+        [1] von Mises-Fisher distribution: Wikipedia
+        [2] arXiv:1812.04616, Section 8.2
+        [3] MIT License (c) 2019 Max Ryabinin - Modified for GraphNeT
+
+        Args:
+            ctx: Autograd context containing saved tensors and metadata.
+            grad_output: Gradient with respect to the output tensor.
+
+        Returns:
+            Tuple of gradients: (None for m, gradient w.r.t. κ).
+        """
+        kappa = ctx.saved_tensors[0]
+        m = ctx.m
+        dtype = ctx.dtype
+        kappa = kappa.double().cpu().numpy()
+        if np.isclose(m, 3, atol=1e-6):
+            # Initialize gradient array
+            grads = np.zeros_like(kappa)
+
+            # Handle small kappa values (including zero) to avoid division by zero
+            small_mask = np.abs(kappa) < 1e-6
+            grads[small_mask] = -kappa[small_mask] / 3
+
+            # Handle large kappa values
+            large_mask = ~small_mask
+            if np.any(large_mask):
+                kappa_large = kappa[large_mask]
+                grads[large_mask] = 1 / kappa_large - 1 / np.tanh(kappa_large)
+        else:
+            grads = -(
+                (scipy.special.iv(m / 2.0, kappa))
+                / (scipy.special.iv(m / 2.0 - 1, kappa))
+            )
+        return (
+            None,
+            grad_output
+            * torch.from_numpy(grads).to(grad_output.device).type(dtype),
+        )
+
+
+class VonMisesFisherLoss(LossFunction):
+    """General class for calculating von Mises-Fisher loss.
+
+    Requires implementation for specific dimension `m` in which the target and
+    prediction vectors need to be prepared.
+    """
+
+    @classmethod
+    def log_cmk_exact(
+        cls, m: int, kappa: Tensor
+    ) -> Tensor:  # pylint: disable=invalid-name
+        """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss exactly."""
+        return LogCMK.apply(m, kappa)
+
+    @classmethod
+    def log_cmk_approx(
+        cls, m: int, kappa: Tensor
+    ) -> Tensor:  # pylint: disable=invalid-name
+        """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss approx.
+
+        [https://arxiv.org/abs/1812.04616] Sec. 8.2 with additional minus sign.
+        """
+        v = m / 2.0 - 0.5
+        a = torch.sqrt((v + 1) ** 2 + kappa**2)
+        b = v - 1
+        return -a + b * torch.log(b + a)
+
+    @classmethod
+    def log_cmk(
+        cls, m: int, kappa: Tensor, kappa_switch: float = 100.0
+    ) -> Tensor:  # pylint: disable=invalid-name
+        """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss.
+
+        Since `log_cmk_exact` is diverges for `kappa` >~ 700 (using float64
+        precision), and since `log_cmk_approx` is unaccurate for small `kappa`,
+        this method automatically switches between the two at `kappa_switch`,
+        ensuring continuity at this point.
+        """
+        kappa_switch = torch.tensor([kappa_switch]).to(kappa.device)
+        mask_exact = kappa < kappa_switch
+
+        # Ensure continuity at `kappa_switch`
+        offset = cls.log_cmk_approx(m, kappa_switch) - cls.log_cmk_exact(
+            m, kappa_switch
+        )
+        ret = cls.log_cmk_approx(m, kappa) - offset
+        ret[mask_exact] = cls.log_cmk_exact(m, kappa[mask_exact])
+        return ret
+
+    def _evaluate(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Calculate von Mises-Fisher loss for a vector in D dimensons.
+
+        This loss utilises the von Mises-Fisher distribution, which is a
+        probability distribution on the (D - 1) sphere in D-dimensional space.
+
+        Args:
+            prediction: Predicted vector, of shape [batch_size, D].
+            target: Target unit vector, of shape [batch_size, D].
+
+        Returns:
+            Elementwise von Mises-Fisher loss terms.
+        """
+        # Check(s)
+        assert prediction.dim() == 2
+        assert target.dim() == 2
+        assert prediction.size() == target.size()
+
+        # Computing loss
+        m = target.size()[1]
+        k = torch.norm(prediction, dim=1)
+        dotprod = torch.sum(prediction * target, dim=1)
+        elements = -self.log_cmk(m, k) - dotprod
+        return elements
+
+    @abstractmethod
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        raise NotImplementedError
+
+
+class VonMisesFisher2DLoss(VonMisesFisherLoss):
+    """Von Mises-Fisher loss function vectors in the 2D plane."""
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Calculate von Mises-Fisher loss for an angle in the 2D plane.
+
+        Args:
+            prediction: Output of the model. Must have shape [N, 2] where 0th
+                column is a prediction of `angle` and 1st column is an estimate
+                of `kappa`.
+            target: Target tensor, extracted from graph object.
+
+        Returns:
+            loss: Elementwise von Mises-Fisher loss terms. Shape [N,]
+        """
+        # Check(s)
+        assert prediction.dim() == 2 and prediction.size()[1] == 2
+        assert target.dim() == 2
+        assert prediction.size()[0] == target.size()[0]
+
+        # Formatting target
+        angle_true = target[:, 0]
+        t = torch.stack(
+            [
+                torch.cos(angle_true),
+                torch.sin(angle_true),
+            ],
+            dim=1,
+        )
+
+        # Formatting prediction
+        angle_pred = prediction[:, 0]
+        kappa = prediction[:, 1]
+        p = kappa.unsqueeze(1) * torch.stack(
+            [
+                torch.cos(angle_pred),
+                torch.sin(angle_pred),
+            ],
+            dim=1,
+        )
+
+        return self._evaluate(p, t)
+
+
+class EuclideanDistanceLoss(LossFunction):
+    """Mean squared error in three dimensions."""
+
+    @property
+    def lower_bound(self) -> float:
+        """Return 0; the loss is non-negative."""
+        return 0.0
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Calculate 3D Euclidean distance between predicted and target.
+
+        Args:
+            prediction: Output of the model. Must have shape [N, 3]
+            target: Target tensor, extracted from graph object.
+
+        Returns:
+            Elementwise von Mises-Fisher loss terms. Shape [N,]
+        """
+        return torch.sqrt(
+            (prediction[:, 0] - target[:, 0]) ** 2
+            + (prediction[:, 1] - target[:, 1]) ** 2
+            + (prediction[:, 2] - target[:, 2]) ** 2
+        )
+
+
+class VonMisesFisher3DLoss(LossFunction):
+    """Negative log-likelihood of the 3D von Mises-Fisher distribution.
+
+    The density on the unit sphere is `f(t | mu, kappa) = C_3(kappa) *
+    exp(kappa * mu . t)` with normalization `C_3(kappa) = kappa /
+    (4*pi*sinh(kappa))`. Substituting `sinh(kappa) = exp(kappa) *
+    (1 - exp(-2*kappa)) / 2` and, exactly for unit vectors,
+    `kappa * (1 - mu . t) = kappa * ||t - mu||**2 / 2`, the negative
+    log-likelihood becomes
+
+    `kappa * ||t - mu||**2 / 2 - log(kappa / (2*pi*(1 - exp(-2*kappa))))`
+
+    where no term grows like `kappa` — the `exp(kappa)` of the normalizer
+    cancels analytically against the alignment term. Every operation is
+    elementary and on-device (no Bessel functions), the derivative is
+    continuous in `kappa` (no approximation boundary for gradient descent
+    on the concentration to stall at), and the squared-chord angular term
+    stays accurate in float32 at high concentration, where `1 - cos(theta)`
+    is comparable to the floating-point epsilon.
+
+    All arithmetic runs in the dtype of the inputs; resolving sub-degree
+    angular information requires the direction vectors in float32 or better.
+    """
+
+    def __init__(self, eps: float = 1e-8, **kwargs: Any) -> None:
+        """Construct `VonMisesFisher3DLoss`.
+
+        Args:
+            eps: Regularization of the normalizer, evaluated as
+                `(kappa + eps) / (1 - exp(-2*kappa) + 2*eps)` so that value
+                and gradient stay finite at `kappa = 0` while the ratio
+                keeps its exact limit of 1/2 (the uniform value
+                `-log(4*pi)`). Gradients lose accuracy below
+                `kappa ~ sqrt(eps)`, where the distribution is effectively
+                uniform.
+        """
+        super().__init__(**kwargs)
+        self._eps = eps
+
+    @staticmethod
+    def _log_cmk_scaled(kappa: Tensor, eps: float) -> Tensor:
+        """Calculate `log(exp(kappa) * C_3(kappa))`.
+
+        Args:
+            kappa: Concentration parameters, of shape [batch_size,].
+            eps: Regularization, see the constructor.
+
+        Returns:
+            Elementwise `log(exp(kappa) * C_3(kappa))`, shape [batch_size,].
+        """
+        return (
+            torch.log(kappa + eps)
+            - torch.log1p(2 * eps - torch.exp(-2 * kappa))
+            - np.log(2 * np.pi)
+        )
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Calculate von Mises-Fisher loss for a direction in the 3D.
+
+        Args:
+            prediction: Output of the model. Must have shape [N, 4] where
+                columns 0, 1, 2 are predictions of `direction` and last column
+                is an estimate of `kappa`.
+            target: Target unit vector, extracted from graph object.
+
+        Returns:
+            Elementwise von Mises-Fisher loss terms. Shape [N,]
+        """
+        target = target.reshape(-1, 3)
+        # Check(s)
+        assert prediction.dim() == 2 and prediction.size()[1] == 4
+        assert target.dim() == 2
+        assert prediction.size()[0] == target.size()[0]
+
+        # With x the raw model output the task head normalized:
+        direction = prediction[:, :3]  # x / (|x| + eps)
+        direction_norm = torch.norm(direction, dim=1)  # |x| / (|x| + eps)
+        concentration = prediction[:, 3] * direction_norm  # |x|
+        unit_direction = direction / direction_norm.unsqueeze(1)  # x / |x|
+
+        # For unit vectors, concentration * (1 - mu . t) equals
+        # concentration * ||t - mu||**2 / 2 exactly. The squared-chord form
+        # measures the small angular deficit directly, whereas subtracting
+        # cos(theta) from 1 loses all significant digits once theta**2
+        # approaches the floating-point epsilon.
+        sq_chord = torch.sum((target - unit_direction) ** 2, dim=1)
+        return concentration * sq_chord / 2 - self._log_cmk_scaled(
+            concentration, self._eps
+        )
+
+
+class EnsembleLoss(LossFunction):
+    """Chain multiple loss functions together."""
+
+    def __init__(
+        self,
+        loss_functions: List[LossFunction],
+        loss_factors: Optional[List[float]] = None,
+        prediction_keys: Optional[List[List[int]]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Chain multiple loss functions together.
+
+            Optionally apply a weight to each loss function contribution.
+
+            E.g. Loss = RMSE*0.5 + LogCoshLoss*1.5
+
+        Args:
+            loss_functions: A list of loss functions to use.
+                Each loss function contributes a term to the overall loss.
+            loss_factors: An optional list of factors that will be mulitplied
+            to each loss function contribution. Must be ordered according
+            to `loss_functions`. If not given, the weights default to 1.
+            prediction_keys: An optional list of lists of indices for which
+                prediction columns to use for each loss function. If not
+                given, all columns are used for all loss functions.
+        """
+        if loss_factors is None:
+            # add weight of 1 - i.e no discrimination
+            loss_factors = np.repeat(1, len(loss_functions)).tolist()
+
+        assert len(loss_functions) == len(loss_factors)
+        self._factors = loss_factors
+        self._loss_functions = loss_functions
+
+        if prediction_keys is not None:
+            self._prediction_keys: Optional[List[List[int]]] = prediction_keys
+        else:
+            self._prediction_keys = None
+        super().__init__(*args, **kwargs)
+
+    @property
+    def lower_bound(self) -> Optional[float]:
+        """Return the weighted sum of the parts' bounds, if all are known."""
+        bounds = [loss.lower_bound for loss in self._loss_functions]
+        if any(b is None for b in bounds) or any(f < 0 for f in self._factors):
+            return None
+        return float(sum(f * b for f, b in zip(self._factors, bounds)))
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Calculate loss using multiple loss functions.
+
+        Args:
+            prediction: Output of the model.
+            target: Target tensor, extracted from graph object.
+
+        Returns:
+            Elementwise loss terms. Shape [N,]
+        """
+        if self._prediction_keys is None:
+            prediction_keys = [list(range(prediction.size(1)))] * len(
+                self._loss_functions
+            )
+        else:
+            prediction_keys = self._prediction_keys
+        for k, (loss_function, prediction_key) in enumerate(
+            zip(self._loss_functions, prediction_keys)
+        ):
+            if k == 0:
+                elements = self._factors[k] * loss_function._forward(
+                    prediction=prediction[:, prediction_key], target=target
+                )
+            else:
+                elements += self._factors[k] * loss_function._forward(
+                    prediction=prediction[:, prediction_key], target=target
+                )
+        return elements
+
+
+class RMSEVonMisesFisher3DLoss(EnsembleLoss):
+    """Combine the VonMisesFisher3DLoss with RMSELoss."""
+
+    def __init__(self, vmfs_factor: float = 0.05) -> None:
+        """VonMisesFisher3DLoss with a RMSE penality term.
+
+            The VonMisesFisher3DLoss will be weighted with `vmfs_factor`.
+
+        Args:
+            vmfs_factor: A factor applied to the VonMisesFisher3DLoss term.
+            Defaults ot 0.05.
+        """
+        super().__init__(
+            loss_functions=[RMSELoss(), VonMisesFisher3DLoss()],
+            loss_factors=[1, vmfs_factor],
+            prediction_keys=[[0, 1, 2], [0, 1, 2, 3]],
+        )
+
+
+class NegCosLoss(LossFunction):
+    """Negative Cosine error loss."""
+
+    @property
+    def lower_bound(self) -> float:
+        """Return -1, the negative cosine of aligned vectors."""
+        return -1.0
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Implement loss calculation."""
+        # Check(s)
+        assert prediction.dim() == 2
+        if target.dim() != prediction.dim():
+            target = target.squeeze(1)
+        assert prediction.size() == target.size()
+
+        reco_norm = torch.nn.functional.normalize(prediction, dim=1)
+        orig_norm = torch.nn.functional.normalize(target, dim=1)
+        elements = -(reco_norm * orig_norm).sum(dim=1)
+        return elements
+
+
+class CauchyLoss(LossFunction):
+    """Cauchy (Lorentzian) loss with a fixed, learned or predicted scale.
+
+    The homoscedastic term of one output column is
+    `log(1 + (|x - y| / alpha)**2) + log(alpha)`. The scale `alpha` sets
+    which residual size the loss is most sensitive to (its gradient peaks at
+    `|x - y| = alpha`).
+
+    Columns can be combined into `groups` that share a scale and enter
+    through the length of their joint residual `r`, as in the multivariate
+    Cauchy distribution in `d` dimensions:
+    `(1 + d) / 2 * log(1 + (|r| / alpha)**2) + d * log(alpha)`. Unlike a sum
+    over columns this does not depend on how the residual is oriented with
+    respect to the coordinate axes within the group. A group of one column
+    is the term above. The loss is the sum over groups divided by the number
+    of columns.
+
+    The scale is either
+
+    - fixed (default): a float, or one value per group (column),
+    - learned (`learn_alpha`): one scale per group (column), trained with
+      the model as the maximum-likelihood Cauchy scale of the residuals, so
+      it tightens as the predictions improve and no manual schedule is
+      needed. With `n_conditions > 0`, the last `n_conditions` columns of
+      the target are conditioning variables `c` (not regressed) and
+      `log(alpha) = a + c @ B` is linear in them, e.g. separate scales for
+      tracks and cascades when conditioning on the true trackness.
+    - predicted: if the prediction carries more columns than the target,
+      the extra columns are read as per-element scales `sigma` and enter the
+      heteroscedastic term `log(1 + (|x - y| / sigma)**2) + log(sigma)`.
+      `frac` blends the two terms: 0 is purely homoscedastic, 1 purely
+      heteroscedastic.
+    """
+
+    def __init__(
+        self,
+        alpha: Union[float, List[float]] = 1.0,
+        frac: float = 1.0,
+        learn_alpha: bool = False,
+        nb_outputs: Optional[int] = None,
+        n_conditions: int = 0,
+        groups: Optional[List[List[int]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Construct CauchyLoss.
+
+        Args:
+            alpha: Scale of the homoscedastic term; with `learn_alpha` its
+                initial value. A float, or one value per group (per output
+                column without `groups`).
+            frac: Weight of the heteroscedastic term; the homoscedastic term
+                is weighted by `1 - frac`.
+            learn_alpha: If True, the scale is a learned parameter per
+                group (column). Requires `frac = 0` and `groups` or
+                `nb_outputs`.
+            nb_outputs: Number of regressed target columns.
+            n_conditions: Number of trailing target columns that condition
+                the learned scale instead of being regressed.
+            groups: Partition of the output columns into groups with a
+                common scale and a rotation-invariant term, e.g.
+                `[[0, 1], [2], [3]]` for (x, y), z and t. Requires
+                `frac = 0`. Defaults to one group per column.
+        """
+        super().__init__(**kwargs)
+        self._frac = frac
+        self._learn_alpha = learn_alpha
+        self._n_conditions = n_conditions
+        self._last_bound: Optional[float] = None
+        # residuals of the most recent batch, for `monitored_values`
+        self._last_squared: Optional[Tensor] = None
+        self._last_sizes: Optional[Tensor] = None
+        # copies of the fixed tensors on the device in use: moving a CPU
+        # tensor to the GPU at every call would synchronise with the GPU
+        self._device_copies: Dict[Tuple[int, str, str], Tensor] = {}
+        self._unit_size = torch.ones(1)
+
+        self._group_index: Optional[Tensor] = None
+        self._group_size: Optional[Tensor] = None
+        if groups is not None:
+            assert frac == 0, "`groups` require `frac = 0`."
+            columns = sorted(column for group in groups for column in group)
+            assert columns == list(
+                range(len(columns))
+            ), "`groups` must contain every output column exactly once."
+            assert nb_outputs in (None, len(columns))
+            index = torch.empty(len(columns), dtype=torch.long)
+            for number, group in enumerate(groups):
+                index[group] = number
+            self._group_index = index
+            self._group_size = torch.tensor(
+                [float(len(group)) for group in groups]
+            )
+
+        n_scales = len(groups) if groups is not None else nb_outputs
+        self._n_scales = n_scales
+        if not isinstance(alpha, (int, float)):
+            assert frac == 0, "One alpha per column requires `frac = 0`."
+        log_alpha = self._as_log_alpha(alpha)
+
+        if learn_alpha:
+            assert frac == 0, "`learn_alpha` requires `frac = 0`."
+            assert (
+                n_scales is not None
+            ), "`learn_alpha` needs `groups` or `nb_outputs`."
+            parameter = torch.zeros(1 + n_conditions, n_scales)
+            parameter[0] = log_alpha
+            self.log_alpha = torch.nn.Parameter(parameter)
+        else:
+            assert n_conditions == 0, "Conditions require `learn_alpha`."
+            self._fixed_alpha = alpha
+            self._fixed_log_alpha = log_alpha
+        if frac == 0:
+            self._last_bound = self._bound(log_alpha.unsqueeze(0))
+
+    def _as_log_alpha(self, alpha: Union[float, List[float]]) -> Tensor:
+        """Return log(alpha) with one entry per group (column)."""
+        if isinstance(alpha, (int, float)):
+            return torch.full((self._n_scales or 1,), float(np.log(alpha)))
+        assert self._n_scales in (None, len(alpha)), (
+            f"Got {len(alpha)} values of alpha for {self._n_scales} "
+            "groups (columns)."
+        )
+        return torch.log(torch.as_tensor(alpha, dtype=torch.float))
+
+    @property
+    def alpha(self) -> Union[float, List[float]]:
+        """Return the fixed scale(s).
+
+        The fixed scale can be set during training, e.g. to anneal it
+        from a wide to a narrow value. Not available for a learned scale
+        or a purely predicted one (`frac = 1`).
+        """
+        if self._learn_alpha:
+            raise AttributeError("The scale is learned; see `alphas()`.")
+        if self._frac == 1:
+            raise AttributeError("The scale is predicted; alpha is unused.")
+        return self._fixed_alpha
+
+    @alpha.setter
+    def alpha(self, alpha: Union[float, List[float]]) -> None:
+        if self._learn_alpha:
+            raise AttributeError("The scale is learned and cannot be set.")
+        self._fixed_alpha = alpha
+        self._fixed_log_alpha = self._as_log_alpha(alpha)
+        self._device_copies = {}
+        if self._frac == 0:
+            self._last_bound = self._bound(self._fixed_log_alpha.unsqueeze(0))
+
+    # Name of the attribute before the scale became a property.
+    _alpha = alpha
+
+    def _on_device(
+        self, tensor: Tensor, like: Tensor, keep_dtype: bool = False
+    ) -> Tensor:
+        """Return `tensor` on the device (and dtype) of `like`, cached."""
+        dtype = tensor.dtype if keep_dtype else like.dtype
+        if tensor.device == like.device and tensor.dtype == dtype:
+            return tensor
+        key = (id(tensor), str(like.device), str(dtype))
+        copy = self._device_copies.get(key)
+        if copy is None:
+            copy = tensor.to(device=like.device, dtype=dtype)
+            self._device_copies[key] = copy
+        return copy
+
+    def _sizes(self, log_alpha: Tensor) -> Tensor:
+        """Return the number of columns of each scale."""
+        if self._group_size is None:
+            return self._on_device(self._unit_size, log_alpha)
+        return self._on_device(self._group_size, log_alpha)
+
+    def _bound(self, log_alpha: Tensor) -> float:
+        """Return the batch-mean minimum of the homoscedastic loss."""
+        sizes = self._sizes(log_alpha).expand(log_alpha.shape[-1])
+        per_event = (sizes * log_alpha.detach()).sum(dim=-1) / sizes.sum()
+        return float(per_event.mean())
+
+    @property
+    def lower_bound(self) -> Optional[float]:
+        """Return the (size-weighted) mean log(alpha) for `frac = 0`.
+
+        Each term is minimal at zero residual, where it equals `d *
+        log(alpha)`. For a learned scale this is the bound at the
+        current scale for the most recent batch. With a heteroscedastic
+        part (`frac > 0`) the scale is predicted and the loss has no
+        meaningful lower bound.
+        """
+        if self._frac != 0:
+            return None
+        return self._last_bound
+
+    def alphas(self) -> Tensor:
+        """Return the current scale of each group (column).
+
+        For a conditioned scale this is the scale at zero conditions.
+        """
+        if self._learn_alpha:
+            return torch.exp(self.log_alpha[0].detach())
+        return torch.exp(self._fixed_log_alpha)
+
+    def monitored_values(self) -> Dict[str, float]:
+        """Return the scales worth following during training.
+
+        For a fixed scale: `residual_scale_<i>`, the Cauchy scale of the
+        residuals of group (column) `i` in the most recent batch, estimated
+        from their median. It shows which fixed `alpha` would match the
+        current residuals. For a learned scale: the scales (and their
+        condition slopes).
+        """
+        if not self._learn_alpha:
+            if self._last_squared is None:
+                return {}
+            assert self._last_sizes is not None
+            residual_scales = self._scale_estimate(
+                self._last_squared, self._last_sizes
+            )
+            return {
+                f"residual_scale_{i}": float(scale)
+                for i, scale in enumerate(residual_scales)
+            }
+        values = {
+            f"alpha_{i}": float(alpha) for i, alpha in enumerate(self.alphas())
+        }
+        for c, slopes in enumerate(self.log_alpha[1:].detach()):
+            for i, slope in enumerate(slopes):
+                values[f"log_alpha_{i}_slope_{c}"] = float(slope)
+        return values
+
+    def _log_alpha(self, conditions: Optional[Tensor], like: Tensor) -> Tensor:
+        """Return log(alpha), broadcastable to [N, n_scales]."""
+        if not self._learn_alpha:
+            return self._on_device(self._fixed_log_alpha, like).unsqueeze(0)
+        log_alpha = self.log_alpha[0].unsqueeze(0)
+        if conditions is not None:
+            log_alpha = (
+                log_alpha + conditions.to(log_alpha) @ self.log_alpha[1:]
+            )
+        return log_alpha
+
+    def _homoscedastic(
+        self,
+        prediction: Tensor,
+        target: Tensor,
+        conditions: Optional[Tensor] = None,
+    ) -> Tensor:
+        squared = (prediction - target) ** 2
+        log_alpha = self._log_alpha(conditions, squared)
+        if self._group_index is not None:
+            assert squared.size(1) == self._group_index.numel(), (
+                f"`groups` cover {self._group_index.numel()} columns, got "
+                f"{squared.size(1)}."
+            )
+            squared = torch.zeros(
+                squared.size(0),
+                log_alpha.size(1),
+                dtype=squared.dtype,
+                device=squared.device,
+            ).index_add_(
+                1,
+                self._on_device(self._group_index, squared, keep_dtype=True),
+                squared,
+            )
+        sizes = self._sizes(log_alpha)
+        if not self._learn_alpha:
+            # the scale estimate is computed when it is read
+            # (`monitored_values`), not at every call
+            self._last_squared, self._last_sizes = squared.detach(), sizes
+        terms = (1 + sizes) / 2 * torch.log1p(
+            squared * torch.exp(-2 * log_alpha)
+        ) + sizes * log_alpha
+        n_columns = prediction.size(1)
+        # with a fixed scale the bound is constant (set with the scale);
+        # reading it back from the GPU at every call would synchronise
+        if self._frac == 0 and self._learn_alpha:
+            self._last_bound = float(
+                (sizes * log_alpha.detach())
+                .expand_as(terms)
+                .sum(dim=-1)
+                .mean()
+                / n_columns
+            )
+        return (1 - self._frac) * terms.sum(dim=-1) / n_columns
+
+    @staticmethod
+    def _scale_estimate(squared: Tensor, sizes: Tensor) -> Tensor:
+        """Estimate the Cauchy scale of each group from the median residual.
+
+        For a `d`-dimensional Cauchy distribution with scale `alpha`,
+        `|r|**2 / (d * alpha**2)` follows an F(d, 1) distribution.
+        """
+        with torch.no_grad():
+            median = squared.detach().float().median(dim=0).values.cpu()
+            d = sizes.cpu().expand(median.shape[0]).double().numpy()
+            reference = d * scipy.stats.f.ppf(0.5, d, 1)
+            return torch.sqrt(median / torch.as_tensor(reference).float())
+
+    def _heteroscedastic(
+        self, prediction: Tensor, target: Tensor, uncertainty: Tensor
+    ) -> Tensor:
+        return self._frac * torch.mean(
+            torch.log1p((torch.abs(prediction - target) / uncertainty) ** 2)
+            + torch.log(uncertainty),
+            dim=-1,
+        )
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Implement loss calculation."""
+        assert prediction.dim() == 2
+        if target.dim() != prediction.dim():
+            target = target.squeeze(1)
+
+        conditions = None
+        if self._n_conditions > 0:
+            conditions = target[:, -self._n_conditions :]
+            target = target[:, : -self._n_conditions]
+
+        # Columns beyond the target width are per-element scales.
+        uncertainty = prediction[:, target.size(1) :]
+        prediction = prediction[:, : target.size(1)]
+        assert prediction.size() == target.size(), (
+            f"Prediction size {prediction.size()} and target size "
+            f"{target.size()} do not match."
+        )
+
+        if self._frac == 0:
+            if uncertainty.shape[1] > 0:
+                self.warning_once(
+                    "Uncertainty columns are provided but `frac` is 0; "
+                    "they are ignored."
+                )
+            return self._homoscedastic(prediction, target, conditions)
+
+        uncertainty = torch.clamp(uncertainty, min=1e-6)
+        if self._frac == 1:
+            return self._heteroscedastic(prediction, target, uncertainty)
+        return self._homoscedastic(prediction, target) + self._heteroscedastic(
+            prediction, target, uncertainty
+        )
+
+
+class spCauchyLoss(LossFunction):
+    """Spherical Cauchy negative log-likelihood.
+
+    The prediction holds a direction `mu` (first `d` columns, unit norm) and
+    a non-negative magnitude `k` (last column), mapped to the concentration
+    `rho = k / (1 + k)` in `[0, 1)`. The spherical Cauchy density on the unit
+    sphere in `d` dimensions is
+
+        f(x) = C_d * ((1 - rho^2) / (1 + rho^2 - 2 rho mu.x))^(d - 1),
+
+    with a constant `C_d` independent of `rho`. In terms of `k` the ratio is
+    `(1 + 2k) / (1 + 2k(1 + k)(1 - mu.x))`, which is evaluated directly to
+    stay accurate for large `k` (where `1 - rho` underflows). The constant is
+    omitted from the loss.
+
+    Distribution: Kato, S. & McCullagh, P. (2020), "Some properties of a
+    Cauchy family on the sphere derived from the Möbius transformations",
+    Bernoulli 26(4), https://arxiv.org/abs/1510.07679. Regression framework:
+    Tsagris, M., Papastamoulis, P. & Kato, S. (2025), Statistics and
+    Computing 35:51, https://arxiv.org/abs/2409.03292.
+
+    With a fixed concentration `rho` the prediction holds the direction only
+    and the loss is, up to a constant, the rotation-invariant Cauchy loss
+    `(d - 1) * log(1 + |mu - x|**2 / alpha**2)` of the chord between
+    prediction and target, with `alpha**2 = (1 - rho)**2 / rho`.
+
+    The fixed concentration can also depend on a property of each event, e.g.
+    its true trackness, when the resolution differs strongly between event
+    classes: `rho` is then a list of values at the points `rho_knots`, and
+    the target holds that property as an extra last column. The scale
+    `alpha` is interpolated piecewise linearly in `log(alpha)` between the
+    knots (constant beyond them). The loss is then the Cauchy loss above,
+    `(d - 1) * log(1 + |mu - x|**2 / alpha**2)`: every event's loss is 0
+    for an exact prediction, so the lower bound stays 0 although the
+    density at the peak differs between events.
+
+    A second property, e.g. the true visible length, can be added with
+    `rho_knots_2`: `rho` is then a nested list `rho[i][j]` at
+    `(rho_knots[i], rho_knots_2[j])`, the target holds both properties as
+    its last two columns (first property, then second), and `log(alpha)` is
+    interpolated bilinearly on the grid (constant beyond its edges).
+    """
+
+    def __init__(
+        self,
+        rho: Optional[
+            Union[float, Sequence[float], Sequence[Sequence[float]]]
+        ] = None,
+        dim: int = 3,
+        rho_knots: Optional[Sequence[float]] = None,
+        rho_knots_2: Optional[Sequence[float]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Construct spCauchyLoss.
+
+        Args:
+            rho: Fixed concentration in `[0, 1)`. If None (default), the
+                concentration is predicted per event (last column of the
+                prediction). A list gives the concentration at each of
+                `rho_knots`; a nested list `rho[i][j]` the concentration at
+                `(rho_knots[i], rho_knots_2[j])`.
+            dim: Dimension `d` of the vectors; only used for the lower
+                bound of the loss with a fixed `rho`.
+            rho_knots: Increasing values of the event property (the last
+                target column) at which `rho` is given; required for, and
+                only used with, a list `rho`. With `rho_knots_2` the first
+                property is the second-to-last target column.
+            rho_knots_2: Increasing values of a second event property (the
+                last target column) at which `rho` is given; requires
+                `rho_knots` and a nested `rho`.
+        """
+        super().__init__(**kwargs)
+        self._rho: Optional[float] = None
+        # concentrations at the knots, if given as a list
+        # (nested for two properties)
+        self._rho_values: Optional[List[Any]] = None
+        self._rho_knots: Optional[List[float]] = None
+        self._rho_knots_2: Optional[List[float]] = None
+        if isinstance(rho, (int, float)) or rho is None:
+            assert rho_knots is None, "`rho_knots` needs a list `rho`."
+            assert rho_knots_2 is None, "`rho_knots_2` needs a nested `rho`."
+            assert rho is None or 0 <= rho < 1, "`rho` must be in [0, 1)."
+            self._rho = None if rho is None else float(rho)
+        else:
+            assert rho_knots is not None, "A list `rho` needs `rho_knots`."
+            shape: Tuple[int, ...] = (len(rho_knots),)
+            if rho_knots_2 is not None:
+                shape = (len(rho_knots), len(rho_knots_2))
+            values = np.asarray(rho, dtype=float)
+            assert values.shape == shape, (
+                f"`rho` must have the shape of the knots {shape}, got "
+                f"{values.shape}."
+            )
+            for knots in (rho_knots, rho_knots_2):
+                assert knots is None or np.all(
+                    np.diff(knots) > 0
+                ), "The knots must be increasing."
+            assert np.all(
+                (values > 0) & (values < 1)
+            ), "`rho` must be in (0, 1)."
+            self._rho_values = values.tolist()
+            self._rho_knots = [float(x) for x in rho_knots]
+            if rho_knots_2 is not None:
+                self._rho_knots_2 = [float(x) for x in rho_knots_2]
+        self._dim = dim
+        # (knots, log alpha) per device / dtype: building them from Python
+        # lists at every call would copy to (and synchronise with) the GPU
+        self._knot_tensors: Dict[
+            Tuple[str, str], Tuple[Tensor, Optional[Tensor], Tensor]
+        ] = {}
+
+    @property
+    def alpha(self) -> float:
+        """Return the scale of the equivalent Cauchy loss on the chord.
+
+        `alpha**2 = (1 - rho)**2 / rho` for a fixed `rho`, approximately the
+        angular scale in radians. Setting it changes `rho`, e.g. to anneal
+        the loss from a wide to a narrow scale. Not available for a
+        predicted concentration or a `rho` given at knots (see `alphas`).
+        """
+        if self._rho is None:
+            raise AttributeError("No single fixed concentration.")
+        return self._alpha_from_rho(self._rho)
+
+    @alpha.setter
+    def alpha(self, alpha: float) -> None:
+        if self._rho is None:
+            raise AttributeError("No single fixed concentration.")
+        self._rho = self._rho_from_alpha(alpha)
+
+    @property
+    def alphas(self) -> List[Any]:
+        """Return the scale at each knot, for a `rho` given at `rho_knots`.
+
+        Nested like `rho` (`alphas[i][j]`) with `rho_knots_2`. Setting a
+        list of that shape changes the concentration at each knot; a single
+        value sets all knots.
+        """
+        if self._rho_values is None:
+            raise AttributeError("The concentration is not given at knots.")
+        rho = np.asarray(self._rho_values)
+        return ((1 - rho) / np.sqrt(rho)).tolist()
+
+    @alphas.setter
+    def alphas(self, alphas: Union[float, Sequence[Any]]) -> None:
+        if self._rho_knots is None:
+            raise AttributeError("The concentration is not given at knots.")
+        shape: Tuple[int, ...] = (len(self._rho_knots),)
+        if self._rho_knots_2 is not None:
+            shape = (len(self._rho_knots), len(self._rho_knots_2))
+        values = np.broadcast_to(np.asarray(alphas, dtype=float), shape)
+        self._rho_values = np.vectorize(self._rho_from_alpha)(values).tolist()
+        self._knot_tensors = {}
+
+    @staticmethod
+    def _alpha_from_rho(rho: float) -> float:
+        return float((1 - rho) / np.sqrt(rho))
+
+    @staticmethod
+    def _rho_from_alpha(alpha: float) -> float:
+        # k (1 + k) = 1 / alpha^2 with k = rho / (1 - rho)
+        k = 0.5 * (np.sqrt(1 + 4 / alpha**2) - 1)
+        return float(k / (1 + k))
+
+    # Same attribute name as the scale of `CauchyLoss` (e.g. for annealing):
+    # `alpha`, or `alphas` for a `rho` given at knots.
+    @property
+    def _alpha(self) -> Union[float, List[float]]:
+        if self._rho_values is not None:
+            return self.alphas
+        return self.alpha
+
+    @_alpha.setter
+    def _alpha(self, alpha: Union[float, Sequence[float]]) -> None:
+        if self._rho_values is not None:
+            self.alphas = alpha
+        else:
+            self.alpha = float(np.asarray(alpha))
+
+    @property
+    def lower_bound(self) -> Optional[float]:
+        """Return the loss of an exact prediction for a fixed `rho`.
+
+        0 for a `rho` given at `rho_knots`; with a predicted concentration
+        the loss is unbounded.
+        """
+        if self._rho_values is not None:
+            return 0.0
+        if self._rho is None:
+            return None
+        k = self._rho / (1 - self._rho)
+        return float(-(self._dim - 1) * np.log1p(2 * k))
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        assert prediction.dim() == 2
+        assert target.dim() == 2
+        assert prediction.size(0) == target.size(0)
+
+        prediction = prediction.float()
+        if self._rho_knots is not None:
+            return self._forward_with_knots(prediction, target)
+        if self._rho is None:
+            # Last column is the magnitude setting the concentration rho.
+            dim = prediction.size(1) - 1
+            k = prediction[:, dim]
+        else:
+            dim = prediction.size(1)
+            assert dim == self._dim
+            k = torch.full_like(prediction[:, 0], self._rho / (1 - self._rho))
+        assert dim > 1
+        assert target.size(1) == dim
+
+        mu = prediction[:, :dim]
+        # 1 - mu.x from the chord between the unit vectors: `1 - dot` would
+        # round to steps of ~6e-8 (0.02 deg) in single precision.
+        one_minus_dot = 0.5 * ((mu - target.float()) ** 2).sum(dim=-1)
+        log_density = torch.log1p(2.0 * k) - torch.log1p(
+            2.0 * k * (1.0 + k) * one_minus_dot
+        )
+        return -(dim - 1) * log_density
+
+    def _forward_with_knots(
+        self, prediction: Tensor, target: Tensor
+    ) -> Tensor:
+        dim = prediction.size(1)
+        assert dim == self._dim
+        n_properties = 1 if self._rho_knots_2 is None else 2
+        assert target.size(1) == dim + n_properties, (
+            "The last target column(s) must hold the property (properties) "
+            "at the knots."
+        )
+        assert self._rho_knots is not None
+        key = (str(prediction.device), str(prediction.dtype))
+        if key not in self._knot_tensors:
+            self._knot_tensors[key] = (
+                prediction.new_tensor(self._rho_knots),
+                (
+                    None
+                    if self._rho_knots_2 is None
+                    else prediction.new_tensor(self._rho_knots_2)
+                ),
+                prediction.new_tensor(np.log(self.alphas)),
+            )
+        knots, knots_2, log_alpha = self._knot_tensors[key]
+        i, w = self._knot_interval(knots, target[:, dim].float())
+        if knots_2 is None:
+            log_a = torch.lerp(log_alpha[i - 1], log_alpha[i], w)
+        else:
+            j, v = self._knot_interval(knots_2, target[:, dim + 1].float())
+            # bilinear: lerp along the second property, then the first
+            low = torch.lerp(log_alpha[i - 1, j - 1], log_alpha[i - 1, j], v)
+            high = torch.lerp(log_alpha[i, j - 1], log_alpha[i, j], v)
+            log_a = torch.lerp(low, high, w)
+        alpha = torch.exp(log_a)
+        one_minus_dot = 0.5 * (
+            (prediction - target[:, :dim].float()) ** 2
+        ).sum(dim=-1)
+        # 2 k (1 + k) = 2 / alpha^2; the peak value log(1 + 2k) is dropped
+        return (dim - 1) * torch.log1p(2.0 * one_minus_dot / alpha**2)
+
+    @staticmethod
+    def _knot_interval(knots: Tensor, x: Tensor) -> Tuple[Tensor, Tensor]:
+        """Return the upper knot index and the weight of `x` in its interval.
+
+        `x` is clamped to the knot range (constant beyond the knots).
+        """
+        x = x.clamp(knots[0], knots[-1])
+        i = torch.searchsorted(knots, x, right=True).clamp(1, len(knots) - 1)
+        w = (x - knots[i - 1]) / (knots[i] - knots[i - 1])
+        return i, w
+
+
+class KingLoss(LossFunction):
+    """Negative log-likelihood of a King profile on the unit sphere.
+
+    The King profile (King 1962), `(1 + x**2 / (2 * gamma * sigma**2))**-gamma`
+    in the angular distance `x`, is the usual model of the point-spread
+    function of gamma-ray and neutrino telescopes (e.g. Fermi-LAT). Its tail
+    index `gamma > 1` interpolates between a heavy power-law tail
+    (`gamma -> 1`) and a Gaussian of width `sigma` (`gamma -> inf`). On the
+    unit sphere in three dimensions the loss uses the exact form
+
+        f(x | mu) = (1 + c * (1 - mu . x))**-gamma / Z,
+        Z = 2 * pi * (1 - (1 + 2c)**(1 - gamma)) / (c * (gamma - 1)),
+
+    with `c = 1 / (gamma * sigma**2)`, which has the King profile as its
+    small-angle limit and is normalized for every `gamma > 1`.
+
+    The core width is given by a magnitude `k >= 0`, the parameter of the
+    spherical Cauchy distribution with concentration `rho = k / (1 + k)`
+    (Kato & McCullagh 2020): `sigma**2 = 1 / (4 k (1 + k))`. For
+    `gamma = 2` the loss is exactly the spherical Cauchy negative
+    log-likelihood with that concentration, and for `gamma -> inf` it tends
+    to the von Mises-Fisher loss with `kappa = 4 k (1 + k)`.
+
+    `1 - mu . x` is computed from the chord between the unit vectors, which
+    stays accurate in single precision at sub-degree angles.
+    """
+
+    def __init__(
+        self, gamma: Optional[float] = None, eps: float = 1e-6, **kwargs: Any
+    ) -> None:
+        """Construct `KingLoss`.
+
+        Args:
+            gamma: Fixed tail index (> 1). If None (default), the tail index
+                is predicted per event (last column of the prediction).
+            eps: Lower bound on `gamma - 1`, which keeps the
+                normalization finite.
+        """
+        super().__init__(**kwargs)
+        assert gamma is None or gamma > 1, "`gamma` must be larger than 1."
+        self._gamma = gamma
+        self._eps = eps
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Calculate the King loss for a direction in 3D.
+
+        Args:
+            prediction: Output of the model, of shape [N, 5] with the
+                direction in columns 0-2, the magnitude `k` in column 3 and
+                the tail index `gamma` in column 4; [N, 4] (no `gamma`) for
+                a fixed tail index.
+            target: Target unit vectors, of shape [N, 3].
+
+        Returns:
+            Elementwise loss terms, of shape [N,].
+        """
+        assert prediction.dim() == 2
+        assert target.dim() == 2 and target.size(1) == 3
+        # at least single precision (e.g. under bf16 autocast)
+        dtype = torch.promote_types(prediction.dtype, torch.float32)
+        prediction, target = prediction.to(dtype), target.to(dtype)
+        mu = prediction[:, :3]
+        k = prediction[:, 3].clamp(min=0)
+        if self._gamma is None:
+            assert prediction.size(1) == 5, "Expected [direction, k, gamma]."
+            gamma = prediction[:, 4].clamp(min=1 + self._eps)
+        else:
+            assert prediction.size(1) == 4, "Expected [direction, k]."
+            gamma = torch.full_like(k, self._gamma)
+
+        # c > 0: the normalization tends to 4 pi (uniform) as c -> 0
+        c = (4 * k * (1 + k) / gamma).clamp(min=1e-12)
+        one_minus_dot = 0.5 * ((mu - target) ** 2).sum(dim=-1)
+        # log Z, with 1 - (1 + 2c)**(1 - gamma) = -expm1((1 - gamma) L)
+        log_norm = (
+            np.log(2 * np.pi)
+            + torch.log(-torch.expm1((1 - gamma) * torch.log1p(2 * c)))
+            - torch.log(c)
+            - torch.log(gamma - 1)
+        )
+        return gamma * torch.log1p(c * one_minus_dot) + log_norm
+
+
+class StudentTLoss(LossFunction):
+    """Negative log-likelihood of a Student-t distribution.
+
+    For a residual `r = prediction - target` with scale `s` and `nu`
+    degrees of freedom,
+
+        -log f = log(s) + (nu + 1) / 2 * log(1 + r**2 / (nu s**2))
+                 + log Gamma(nu / 2) - log Gamma((nu + 1) / 2)
+                 + log(nu * pi) / 2.
+
+    `nu = 1` is the Cauchy distribution and `nu -> inf` the normal
+    distribution; in between the tail falls like `|r|**-(nu + 1)`. The scale
+    and, optionally, `nu` are predicted per element. With several target
+    columns the loss is the mean over the columns.
+    """
+
+    def __init__(
+        self, nu: Optional[float] = None, eps: float = 1e-6, **kwargs: Any
+    ) -> None:
+        """Construct `StudentTLoss`.
+
+        Args:
+            nu: Fixed degrees of freedom (> 0). If None (default), they are
+                predicted per element (last block of the prediction).
+            eps: Lower bound on the scale and on `nu`.
+        """
+        super().__init__(**kwargs)
+        assert nu is None or nu > 0, "`nu` must be positive."
+        self._nu = nu
+        self._eps = eps
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """Calculate the Student-t loss.
+
+        Args:
+            prediction: Output of the model, of shape [N, 3T] for `T` target
+                columns: values, scales and degrees of freedom (in blocks of
+                `T` columns); [N, 2T] (no degrees of freedom) for a fixed
+                `nu`.
+            target: Targets, of shape [N, T].
+
+        Returns:
+            Elementwise loss terms, of shape [N,].
+        """
+        assert prediction.dim() == 2
+        if target.dim() == 1:
+            target = target.unsqueeze(1)
+        n = target.size(1)
+        # at least single precision (e.g. under bf16 autocast)
+        dtype = torch.promote_types(prediction.dtype, torch.float32)
+        prediction, target = prediction.to(dtype), target.to(dtype)
+        value = prediction[:, :n]
+        scale = prediction[:, n : 2 * n].clamp(min=self._eps)
+        if self._nu is None:
+            assert prediction.size(1) == 3 * n, (
+                f"Expected {3 * n} columns (values, scales, nu), got "
+                f"{prediction.size(1)}."
+            )
+            nu = prediction[:, 2 * n :].clamp(min=self._eps)
+        else:
+            assert prediction.size(1) == 2 * n, (
+                f"Expected {2 * n} columns (values, scales), got "
+                f"{prediction.size(1)}."
+            )
+            nu = torch.full_like(scale, self._nu)
+
+        z2 = ((value - target) / scale) ** 2
+        elements = (
+            torch.log(scale)
+            + (nu + 1) / 2 * torch.log1p(z2 / nu)
+            + torch.lgamma(nu / 2)
+            - torch.lgamma((nu + 1) / 2)
+            + 0.5 * torch.log(nu * np.pi)
+        )
+        return elements.mean(dim=-1)
+
+
+class RMSEAdjustedLoss(LossFunction):
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+
+        assert prediction.dim() == 2
+        assert prediction.size() == target.size()
+
+        elements = torch.mean(
+            (prediction - target) ** 2 / ((1 + target) ** (0.5)), dim=-1
+        )
+        return elements
+
+
+class PoissonLoss(LossFunction):
+
+    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+
+        loss_func = nn.PoissonNLLLoss(log_input=False, reduction="none")
+        test = loss_func(prediction.float(), target.float())
+        return test
 
 
 class FocalCrossEntropyLoss(LossFunction):
@@ -350,19 +1750,6 @@ class FocalCrossEntropyLoss(LossFunction):
         return (1 - p_t) ** self._gamma * cross_loss
 
 
-class BinaryCrossEntropyLoss(LossFunction):
-    """Compute binary cross entropy loss.
-
-    Predictions are vector probabilities (i.e., values between 0 and 1), and
-    targets should be 0 and 1.
-    """
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        return binary_cross_entropy(
-            prediction.float(), target.float(), reduction="none"
-        )
-
-
 class BinaryCrossEntropyLossLogits(LossFunction):
     """Compute binary cross entropy loss.
 
@@ -373,427 +1760,6 @@ class BinaryCrossEntropyLossLogits(LossFunction):
     def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
         return binary_cross_entropy_with_logits(
             prediction.float(), target.float(), reduction="none"
-        )
-
-
-class FocalBinaryCrossEntropyLoss(LossFunction):
-    """Compute binary cross entropy loss.
-
-    Predictions are vector probabilities (i.e., values between 0 and 1), and
-    targets should be 0 and 1.
-    """
-
-    def __init__(
-        self,
-        gamma: float = 2,
-        alpha: float = 0.25,
-        logits: bool = False,
-        *args: Any,
-        **kwargs: Any,
-    ):
-        """Construct CrossEntropyLoss."""
-        # Base class constructor
-        super().__init__(*args, **kwargs)
-
-        self._gamma = gamma
-        self._alpha = alpha
-
-        self._logits = logits
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        if self._logits:
-            binary_loss = binary_cross_entropy_with_logits(
-                prediction.float(),
-                target.float(),
-                reduction="none",
-            )
-            prediction = torch.sigmoid(prediction.float())
-        else:
-            binary_loss = binary_cross_entropy(
-                prediction.float(),
-                target.float(),
-                reduction="none",
-            )
-
-        a_t = self._alpha * target + (1 - self._alpha) * (1 - target)
-        p_t = prediction * target + (1 - prediction) * (1 - target)
-        return a_t * (1 - p_t) ** self._gamma * binary_loss
-
-
-class LogCMK(torch.autograd.Function):
-    """MIT License.
-
-    Copyright (c) 2019 Max Ryabinin
-
-    Permission is hereby granted, free of charge, to any person obtaining a
-    copy of this software and associated documentation files (the "Software"),
-    to deal in the Software without restriction, including without limitation
-    the rights to use, copy, modify, merge, publish, distribute, sublicense,
-    and/or sell copies of the Software, and to permit persons to whom the
-    Software is furnished to do so, subject to the following conditions:
-
-    The above copyright notice and this permission notice shall be included in
-    all copies or substantial portions of the Software.
-
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-    DEALINGS IN THE SOFTWARE.
-    _____________________
-
-    From [https://github.com/mryab/vmf_loss/blob/master/losses.py] Modified to
-    use modified Bessel function instead of exponentially scaled ditto
-    (i.e. `.ive` -> `.iv`) as indicated in [1812.04616] in spite of suggestion
-    in Sec. 8.2 of this paper. The change has been validated through comparison
-    with exact calculations for `m=2` and `m=3` and found to yield the correct
-    results.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: Any, m: int, kappa: Tensor
-    ) -> Tensor:  # pylint: disable=invalid-name,arguments-differ
-        """Forward pass."""
-        dtype = kappa.dtype
-        ctx.save_for_backward(kappa)
-        ctx.m = m
-        ctx.dtype = dtype
-        kappa = kappa.double()
-        iv = torch.from_numpy(
-            scipy.special.iv(m / 2.0 - 1, kappa.cpu().numpy())
-        ).to(kappa.device)
-        return (
-            (m / 2.0 - 1) * torch.log(kappa)
-            - torch.log(iv)
-            - (m / 2) * np.log(2 * np.pi)
-        ).type(dtype)
-
-    @staticmethod
-    def backward(
-        ctx: Any, grad_output: Tensor
-    ) -> Tensor:  # pylint: disable=invalid-name,arguments-differ
-        """Backward pass."""
-        kappa = ctx.saved_tensors[0]
-        m = ctx.m
-        dtype = ctx.dtype
-        kappa = kappa.double().cpu().numpy()
-        grads = -(
-            (scipy.special.iv(m / 2.0, kappa))
-            / (scipy.special.iv(m / 2.0 - 1, kappa))
-        )
-        return (
-            None,
-            grad_output
-            * torch.from_numpy(grads).to(grad_output.device).type(dtype),
-        )
-
-
-class VonMisesFisherLoss(LossFunction):
-    """General class for calculating von Mises-Fisher loss.
-
-    Requires implementation for specific dimension `m` in which the target and
-    prediction vectors need to be prepared.
-    """
-
-    def __init__(
-        self, kappa_switch: float = 100.0, contamination: float = 0.0
-    ) -> None:
-        """Construct VonMisesFisherLoss.
-
-        Args:
-            kappa_switch: The value of `kappa` at which the exact and approximate
-                calculation of $log C_{m}(k)$ switch.
-        """
-        super().__init__()
-        self._kappa_switch = kappa_switch
-        self._contamination = contamination
-
-    @classmethod
-    def log_cmk_exact(
-        cls, m: int, kappa: Tensor
-    ) -> Tensor:  # pylint: disable=invalid-name
-        """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss exactly."""
-        return LogCMK.apply(m, kappa)
-
-    @classmethod
-    def log_cmk_approx(
-        cls, m: int, kappa: Tensor
-    ) -> Tensor:  # pylint: disable=invalid-name
-        """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss approx.
-
-        [https://arxiv.org/abs/1812.04616] Sec. 8.2 with additional minus sign.
-        """
-        nu = m / 2.0 - 1  # the order of the Bessel function
-        a = torch.sqrt((nu) ** 2 + kappa**2)
-        return -a + nu * torch.log(nu + a)
-
-    @classmethod
-    def log_cmk(
-        cls, m: int, kappa: Tensor, kappa_switch: float
-    ) -> Tensor:  # pylint: disable=invalid-name
-        """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss.
-
-        Since `log_cmk_exact` is diverges for `kappa` >~ 700 (using float64
-        precision), and since `log_cmk_approx` is unaccurate for small `kappa`,
-        this method automatically switches between the two at `kappa_switch`,
-        ensuring continuity at this point.
-        """
-
-        kappa_switch = torch.tensor([kappa_switch]).to(kappa.device)
-
-        if kappa_switch > 0:
-
-            mask_exact = kappa < kappa_switch
-
-            # Ensure continuity at `kappa_switch`
-            offset = cls.log_cmk_approx(m, kappa_switch) - cls.log_cmk_exact(
-                m, kappa_switch
-            )
-            ret = cls.log_cmk_approx(m, kappa) - offset
-            ret[mask_exact] = cls.log_cmk_exact(m, kappa[mask_exact])
-        else:
-            # If kappa_switch is 0, we always use the approximation
-            ret = cls.log_cmk_approx(m, kappa)
-        return ret
-
-    def _evaluate(self, prediction: Tensor, target: Tensor) -> Tensor:
-        """Calculate von Mises-Fisher loss for a vector in D dimensons.
-
-        This loss utilises the von Mises-Fisher distribution, which is a
-        probability distribution on the (D - 1) sphere in D-dimensional space.
-
-        Args:
-            prediction: Predicted vector, of shape [batch_size, D].
-            target: Target unit vector, of shape [batch_size, D].
-
-        Returns:
-            Elementwise von Mises-Fisher loss terms.
-        """
-        # Check(s)
-        assert prediction.dim() == 2
-        assert target.dim() == 2
-        assert prediction.size() == target.size()
-
-        # Computing loss
-        m = target.size()[1]
-        k = torch.norm(prediction, dim=1)
-        dotprod = torch.sum(prediction * target, dim=1)
-
-        elements = -self.log_cmk(m, k, self._kappa_switch) - dotprod
-        if self._contamination > 0.0:
-            # Add contamination term
-            uniform_log_prob = self._log_uniform_sphere_torch(
-                m
-            ) * torch.ones_like(elements)
-            elements = torch.logsumexp(
-                torch.stack(
-                    [
-                        np.log(1 - self._contamination) + elements,
-                        np.log(self._contamination) + uniform_log_prob,
-                    ],
-                    dim=0,
-                ),
-                dim=0,
-            )
-        return elements
-
-    def _log_uniform_sphere_torch(self, m):
-        # m: integer >= 1 (ambient dimension)
-        return -(
-            torch.log(torch.tensor(2.0))
-            + (m / 2.0) * torch.log(torch.tensor(torch.pi))
-            - torch.lgamma(torch.tensor(m / 2.0))
-        )
-
-    @abstractmethod
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        raise NotImplementedError
-
-
-class VonMisesFisher2DLoss(VonMisesFisherLoss):
-    """Von Mises-Fisher loss function vectors in the 2D plane."""
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        """Calculate von Mises-Fisher loss for an angle in the 2D plane.
-
-        Args:
-            prediction: Output of the model. Must have shape [N, 2] where 0th
-                column is a prediction of `angle` and 1st column is an estimate
-                of `kappa`.
-            target: Target tensor, extracted from graph object.
-
-        Returns:
-            loss: Elementwise von Mises-Fisher loss terms. Shape [N,]
-        """
-        # Check(s)
-        assert prediction.dim() == 2 and prediction.size()[1] == 2
-        assert target.dim() == 2
-        assert prediction.size()[0] == target.size()[0]
-
-        # Formatting target
-        angle_true = target[:, 0]
-        t = torch.stack(
-            [
-                torch.cos(angle_true),
-                torch.sin(angle_true),
-            ],
-            dim=1,
-        )
-
-        # Formatting prediction
-        angle_pred = prediction[:, 0]
-        kappa = prediction[:, 1]
-        p = kappa.unsqueeze(1) * torch.stack(
-            [
-                torch.cos(angle_pred),
-                torch.sin(angle_pred),
-            ],
-            dim=1,
-        )
-
-        return self._evaluate(p, t)
-
-
-class EuclideanDistanceLoss(LossFunction):
-    """Mean squared error in three dimensions."""
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        """Calculate 3D Euclidean distance between predicted and target.
-
-        Args:
-            prediction: Output of the model. Must have shape [N, 3]
-            target: Target tensor, extracted from graph object.
-
-        Returns:
-            Elementwise von Mises-Fisher loss terms. Shape [N,]
-        """
-        return torch.sqrt(
-            (prediction[:, 0] - target[:, 0]) ** 2
-            + (prediction[:, 1] - target[:, 1]) ** 2
-            + (prediction[:, 2] - target[:, 2]) ** 2
-        )
-
-
-class VonMisesFisher3DLoss(VonMisesFisherLoss):
-    """Von Mises-Fisher loss function vectors in the 3D plane."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Construct VonMisesFisher3DLoss."""
-        super().__init__(*args, **kwargs)
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        """Calculate von Mises-Fisher loss for a direction in the 3D.
-
-        Args:
-            prediction: Output of the model. Must have shape [N, 4] where
-                columns 0, 1, 2 are predictions of `direction` and last column
-                is an estimate of `kappa`.
-            target: Target tensor, extracted from graph object.
-
-        Returns:
-            Elementwise von Mises-Fisher loss terms. Shape [N,]
-        """
-        target = target.reshape(-1, 3)
-        # Check(s)
-        assert prediction.dim() == 2 and prediction.size()[1] == 4
-        assert target.dim() == 2
-        assert prediction.size()[0] == target.size()[0]
-
-        kappa = prediction[:, 3]
-        p = kappa.unsqueeze(1) * prediction[:, [0, 1, 2]]
-        return self._evaluate(p, target)
-
-
-class EnsembleLoss(LossFunction):
-    """Chain multiple loss functions together."""
-
-    def __init__(
-        self,
-        loss_functions: List[LossFunction],
-        loss_factors: Optional[List[float]] = None,
-        prediction_keys: Optional[List[List[int]]] = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        """Chain multiple loss functions together.
-
-            Optionally apply a weight to each loss function contribution.
-
-            E.g. Loss = RMSE*0.5 + LogCoshLoss*1.5
-
-        Args:
-            loss_functions: A list of loss functions to use.
-                Each loss function contributes a term to the overall loss.
-            loss_factors: An optional list of factors that will be mulitplied
-            to each loss function contribution. Must be ordered according
-            to `loss_functions`. If not given, the weights default to 1.
-            prediction_keys: An optional list of lists of indices for which
-                prediction columns to use for each loss function. If not
-                given, all columns are used for all loss functions.
-        """
-        if loss_factors is None:
-            # add weight of 1 - i.e no discrimination
-            loss_factors = np.repeat(1, len(loss_functions)).tolist()
-
-        assert len(loss_functions) == len(loss_factors)
-        self._factors = loss_factors
-        self._loss_functions = loss_functions
-
-        if prediction_keys is not None:
-            self._prediction_keys: Optional[List[List[int]]] = prediction_keys
-        else:
-            self._prediction_keys = None
-        super().__init__(*args, **kwargs)
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        """Calculate loss using multiple loss functions.
-
-        Args:
-            prediction: Output of the model.
-            target: Target tensor, extracted from graph object.
-
-        Returns:
-            Elementwise loss terms. Shape [N,]
-        """
-        if self._prediction_keys is None:
-            prediction_keys = [list(range(prediction.size(1)))] * len(
-                self._loss_functions
-            )
-        else:
-            prediction_keys = self._prediction_keys
-        for k, (loss_function, prediction_key) in enumerate(
-            zip(self._loss_functions, prediction_keys)
-        ):
-            if k == 0:
-                elements = self._factors[k] * loss_function._forward(
-                    prediction=prediction[:, prediction_key], target=target
-                )
-            else:
-                elements += self._factors[k] * loss_function._forward(
-                    prediction=prediction[:, prediction_key], target=target
-                )
-        return elements
-
-
-class RMSEVonMisesFisher3DLoss(EnsembleLoss):
-    """Combine the VonMisesFisher3DLoss with RMSELoss."""
-
-    def __init__(self, vmfs_factor: float = 0.05) -> None:
-        """VonMisesFisher3DLoss with a RMSE penality term.
-
-            The VonMisesFisher3DLoss will be weighted with `vmfs_factor`.
-
-        Args:
-            vmfs_factor: A factor applied to the VonMisesFisher3DLoss term.
-            Defaults ot 0.05.
-        """
-        super().__init__(
-            loss_functions=[RMSELoss(), VonMisesFisher3DLoss()],
-            loss_factors=[1, vmfs_factor],
-            prediction_keys=[[0, 1, 2], [0, 1, 2, 3]],
         )
 
 
@@ -869,173 +1835,6 @@ class RegressionAsMulticlassification(LossFunction):
         return loss
 
 
-# class CauchyLoss(LossFunction):
-#     """Cauchy loss function."""
-#     def __init__(self, alpha : int = 0.1, **kwargs: Any) -> None:
-#         self._alpha = alpha
-#         super().__init__(**kwargs)
-
-#     def _forward(self, prediction: Tensor, target: Tensor, alpha: Optional[Tensor] = None) -> Tensor:
-#         """Implement loss calculation."""
-#         # Check(s)
-#         if alpha is not None:
-#             alpha = self._alpha
-
-#         assert prediction.dim() == 2
-#         if target.dim() != prediction.dim():
-#             target = target.squeeze(1)
-#         assert prediction.size() == target.size()
-#         elements = torch.sum(alpha**2/2*(torch.log(1 + ((abs(prediction - target))/alpha)**2)), dim=-1)
-#         return elements
-
-
-class CauchyLoss(LossFunction):
-    """Cauchy loss function with heterocedastic uncertainty."""
-
-    def __init__(
-        self,
-        alpha: float = 1.0,
-        frac: float = 1,
-        cold_start: int = -1,
-        phase_in_steps: int = 10000,
-        **kwargs: Any,
-    ) -> None:
-        """Construct CauchyLoss.
-
-        Args:
-            alpha: A fixed alpha value used for the Cauchy loss.
-                Defaults to 1.0.
-                frac: A fraction of the loss that is calculated using the uncertainty
-                1 means that the loss is fully heteroscedastic, 0 means that the loss is fully
-                homoscedastic.
-        """
-        # send to device
-        self._alpha = alpha
-        self._frac = frac
-        self._cfrac = frac
-        self._cold_start = cold_start
-        self._phase_in_steps = phase_in_steps
-        self._phase_in_count = 0
-
-        super().__init__(**kwargs)
-
-    def determine_frac(self, epoch: int) -> None:
-        """Determine the fraction of the loss that is calculated using the
-        uncertainty.
-
-        Args:
-            epoch: The current epoch number.
-        """
-        assert (
-            self._frac > 0
-        ), "frac must be greater than 0 in order to phase in the uncertainty."
-
-        if epoch < self._cold_start:
-            self._cfrac = 1e-4
-        elif self._cfrac < self._frac:
-            self._phase_in_count += 1
-            self._cfrac = self._cfrac * (
-                self._phase_in_count / self._phase_in_steps
-            )
-
-    def homoscedastic(self, prediction, target) -> bool:
-        """Calculate the homoscedastic loss."""
-        elements = (1 - self._frac) * torch.mean(
-            torch.log1p(((abs(prediction - target)) / self._alpha) ** 2)
-            + np.log(self._alpha),
-            dim=-1,
-        )
-        # offset to ensure positive loss values excact for the homoscedastic case
-        # elements -= (1-self._frac) * np.log(self._alpha)
-        # assert torch.all(elements >= 0), f"Loss values should be positive: but found {elements}: predictions{prediction}  target{target}"
-        return elements
-
-    def heteroscedastic(self, prediction, target, uncertainty) -> Tensor:
-        """Calculate the heteroscedastic loss."""
-        elements = self._frac * torch.mean(
-            torch.log1p(((abs(prediction - target)) / uncertainty) ** 2)
-            + torch.log(uncertainty),
-            dim=-1,
-        )
-        # offset to ensure positive loss values in the heteroscedastic case we use the minimum value that the uncertainty can take
-        # elements -= self._frac * np.log(1e-6)  # This is the minimum value that the uncertainty can take
-        # assert torch.all(elements >= 0), f"Loss values should be positive: but found {elements}: predictions{prediction}  target{target}"
-        return elements
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        """Implement loss calculation."""
-        # Check(s)
-
-        if self._cold_start >= 0:
-            self.determine_frac(self.current_epoch)
-
-        assert prediction.dim() == 2
-        if target.dim() != prediction.dim():
-            target = target.squeeze(1)
-
-        # Extract the uncertainty from the last column of the prediction
-        uncertainty = prediction[:, target.size(1) :]
-        prediction = prediction[:, : target.size(1)]
-
-        assert (
-            prediction.size() == target.size()
-        ), f"Prediction size {prediction.size()} and target size {target.size()} do not match."
-
-        if (uncertainty.shape[1] > 0) & (self._cfrac == 0.0):
-            self.warning_once(
-                "uncertainty is provided, but frac is set to 0. The uncertainty will be ignored."
-            )
-        # Ensure that uncertainty is non-negative
-        if uncertainty.shape[1] > 0:
-            uncertainty = torch.clamp(uncertainty, min=1e-6)
-
-        if self._cfrac == 0:
-            # If the loss is fully homoscedastic, we use the fixed alpha value
-            elements = self.homoscedastic(prediction, target)
-        elif self._cfrac == 1:
-            # If the loss is fully heteroscedastic, we use the uncertainty
-            elements = self.heteroscedastic(prediction, target, uncertainty)
-        else:
-            # If the loss is a mix of homoscedastic and heteroscedastic, we use both
-            elements = self.homoscedastic(
-                prediction, target
-            ) + self.heteroscedastic(prediction, target, uncertainty)
-        return elements
-
-
-class CauchyVonMisesFisher3DLoss(EnsembleLoss):
-    """Combine the VonMisesFisher3DLoss with CauchyLoss."""
-
-    def __init__(
-        self,
-        vmfs_factor: float = 0.05,
-        alpha=0.1,
-        kappa_switch=0,
-        contamination=0.0,
-    ) -> None:
-        """VonMisesFisher3DLoss with a Cauchy penality term.
-
-            The VonMisesFisher3DLoss will be weighted with `vmfs_factor`.
-
-        Args:
-            vmfs_factor: A factor applied to the VonMisesFisher3DLoss term.
-            Defaults ot 0.05.
-        """
-
-        loss_function = CauchyLoss(alpha=alpha, frac=0.0)
-        prediction_keys = [[0, 1, 2], [0, 1, 2, 3]]
-        super().__init__(
-            loss_functions=[
-                loss_function,
-                VonMisesFisher3DLoss(
-                    kappa_switch=kappa_switch, contamination=contamination
-                ),
-            ],
-            loss_factors=[(1 - vmfs_factor), vmfs_factor],
-            prediction_keys=prediction_keys,
-        )
-
-
 class GaussianLoss(LossFunction):
     """Gaussian loss function.
 
@@ -1063,46 +1862,6 @@ class GaussianLoss(LossFunction):
 
         elements = loss(prediction, target, self._std)
         return elements
-
-
-class spCauchyLoss(LossFunction):
-    """Spherical Cauchy loss function.
-
-    Spherical Cauchy negative log-likelihood loss. Distribution defined in:
-    Kato, S. & McCullagh, P. (2020). Some properties of a Cauchy family on the
-    sphere derived from the Möbius transformations.Bernoulli, 26(4): 3224–3248.
-    https://arxiv.org/abs/1510.07679
-
-    Regression/MLE framework: Tsagris, M., Papastamoulis, P. & Kato, S. (2025).
-    Directional data analysis using the spherical Cauchy and the Poisson
-    kernel-based distribution. Statistics and Computing, 35:51.
-    https://arxiv.org/abs/2409.03292
-    """
-
-    def _forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        assert prediction.dim() == 2
-        assert target.dim() == 2
-        assert prediction.size(0) == target.size(0)
-
-        dim = (
-            prediction.size(1) - 1
-        )  # last dimensions is the norm of the predicted vector, which is used to calculate the concentration parameter rho
-        assert dim >= 1
-        assert target.size(1) == dim
-
-        mu = prediction[:, :dim]
-        rho = prediction[:, dim] / (
-            1.0 + prediction[:, dim]
-        )  # concentration parameter in [0, 1)
-        dot = (mu * target).sum(
-            dim=-1
-        )  # cosine similarity between predicted direction and target direction
-        alpha = (dim - 1) / 2.0
-        log_numer = alpha * torch.log(1.0 - rho**2 + 1e-7)
-        denom = (1.0 - 2.0 * rho * dot + rho**2).clamp(min=1e-7)
-        log_denom = (alpha + 1.0) * torch.log(denom)
-        log_prob = log_numer - log_denom
-        return -log_prob
 
 
 class HeterocedasticGaussianLoss(LossFunction):

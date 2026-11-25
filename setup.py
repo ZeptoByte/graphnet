@@ -6,11 +6,10 @@ import versioneer
 
 # Requirements definitions
 SETUP_REQUIRES = [
-    "setuptools>=59.5.0",
+    "setuptools>=68.2.2",
 ]
 
 INSTALL_REQUIRES = [
-    "awkward>=1.8,<2.0",
     "colorlog>=6.6",
     "configupdater",
     "dill>=0.3",
@@ -23,14 +22,17 @@ INSTALL_REQUIRES = [
     "scikit_learn>=1.0",
     "scipy>=1.7",
     "sqlalchemy>=1.4",
-    "timer>=0.2",
     "tqdm>=4.64",
     "wandb>=0.12",
-    "polars[rtcompat]==1.39.0",
+    "polars >=0.19",
     "torchscale==0.2.0",
     "h5py>= 3.7.0",
+    "lmdb>=1.4.1",
 ]
 
+# Security: pytorch-lightning versions 2.6.2 and 2.6.3 were compromised in a
+# PyPI supply-chain incident. We restrict extras to <=2.6.1 to avoid those
+# releases. See: https://socket.dev/blog/lightning-pypi-package-compromised
 EXTRAS_REQUIRE = {
     "develop": [
         "black",
@@ -48,14 +50,40 @@ EXTRAS_REQUIRE = {
         "sphinx-material",
         "sphinx-autodoc-typehints",
         "versioneer",
+        "flake8",
     ],
-    "torch": [
-        "torch>=2.1,<2.3",
-        "torch-cluster>=1.6",
-        "torch-scatter>=2.0",
-        "torch-sparse>=0.6",
-        "torch-geometric==2.7.0",
-        "pytorch-lightning>=2.0",
+    # --- PyTorch 2.5.1 ---
+    "torch-25": [
+        "torch==2.5.1",
+        "torch-geometric<2.8",
+        "pyg_lib",
+        "torch_scatter",
+        "torch_sparse",
+        "torch_cluster",
+        "torch_spline_conv",
+        "pytorch-lightning>=2.0,<=2.6.1",
+    ],
+    # --- PyTorch 2.6.0 ---
+    "torch-26": [
+        "torch==2.6.0",
+        "torch-geometric<2.8",
+        "pyg_lib",
+        "torch_scatter",
+        "torch_sparse",
+        "torch_cluster",
+        "torch_spline_conv",
+        "pytorch-lightning>=2.0,<=2.6.1",
+    ],
+    # --- PyTorch 2.7.0 ---
+    "torch-27": [
+        "torch==2.7.0",
+        "torch-geometric<2.8",
+        "pyg_lib",
+        "torch_scatter",
+        "torch_sparse",
+        "torch_cluster",
+        "torch_spline_conv",
+        "pytorch-lightning>=2.0,<=2.6.1",
     ],
 }
 
@@ -84,7 +112,7 @@ setup(
     name="graphnet",
     version=versioneer.get_version(),
     description=(
-        "A common library for using graph neural networks (GNNs) in neutrino "
+        "A common library for using deep learning in neutrino "
         "telescope experiments."
     ),
     license="Apache 2.0",

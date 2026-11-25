@@ -21,6 +21,14 @@ TEST_SQLITE_DATA = os.path.join(
 TEST_PARQUET_DATA = os.path.join(
     TEST_DATA_DIR, "parquet", _test_dataset_name, "merged"
 )
+TEST_IMAGE_DIR = os.path.join(TEST_DATA_DIR, "images")
+TEST_IC86MAIN_IMAGE = os.path.join(TEST_IMAGE_DIR, "IC86main_array_test.npy")
+TEST_IC86LOWERDC_IMAGE = os.path.join(
+    TEST_IMAGE_DIR, "IC86lower_deepcore_test.npy"
+)
+TEST_IC86UPPERDC_IMAGE = os.path.join(
+    TEST_IMAGE_DIR, "IC86upper_deepcore_test.npy"
+)
 
 # Example data
 EXAMPLE_DATA_DIR = os.path.join(DATA_DIR, "examples")
@@ -41,3 +49,5 @@ GEOMETRY_TABLE_DIR = os.path.join(DATA_DIR, "geometry_tables")
 ICECUBE_GEOMETRY_TABLE_DIR = os.path.join(GEOMETRY_TABLE_DIR, "icecube")
 PROMETHEUS_GEOMETRY_TABLE_DIR = os.path.join(GEOMETRY_TABLE_DIR, "prometheus")
 LIQUIDO_GEOMETRY_TABLE_DIR = os.path.join(GEOMETRY_TABLE_DIR, "liquid-o")
+MAGIC_GEOMETRY_TABLE_DIR = os.path.join(GEOMETRY_TABLE_DIR, "magic")
+NUBENCH_GEOMETRY_TABLE_DIR = os.path.join(GEOMETRY_TABLE_DIR, "nubench")

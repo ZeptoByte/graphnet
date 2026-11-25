@@ -7,6 +7,7 @@ member methods in `DataLoader`.
 from typing import Tuple
 
 import pytest
+import torch
 
 from graphnet.data.constants import FEATURES, TRUTH
 from graphnet.constants import TEST_PARQUET_DATA, TEST_SQLITE_DATA
@@ -55,7 +56,7 @@ def test_none_selection() -> None:
 )
 def test_array_selection(selection: Tuple[int]) -> None:
     """Test agreement of the two ways to calculate this loss."""
-    (train_dataloader, test_dataloader) = make_train_validation_dataloader(
+    train_dataloader, test_dataloader = make_train_validation_dataloader(
         db=TEST_SQLITE_DATA,
         graph_definition=graph_definition,
         selection=list(selection),
@@ -101,3 +102,69 @@ def test_parquet() -> None:
     except AssertionError as e:
         assert str(e).startswith("Format of input file")
         assert str(e).endswith("is not supported.")
+
+
+def test_compute_budget_bucketing() -> None:
+    """Mini-batches respect the budget and keep all multi-node graphs."""
+    from torch_geometric.data import Data
+    from graphnet.training.utils import collator_compute_budget_bucketing
+
+    lengths = [1, 2, 3, 5, 8, 13, 21, 4, 4, 30]
+    graphs = [Data(x=torch.zeros(n, 1), n_tokens=n) for n in lengths]
+    collator = collator_compute_budget_bucketing(
+        max_compute=200, parameter="n_tokens", gamma=2.0
+    )
+    batches = collator(graphs)
+
+    kept = sorted(int(n) for b in batches for n in b.n_tokens)
+    assert kept == sorted(n for n in lengths if n > 1)
+    for batch in batches:
+        max_length = int(batch.n_tokens.max())
+        # A single graph may exceed the budget on its own.
+        assert batch.num_graphs == 1 or (
+            batch.num_graphs * max_length**2 <= 200
+        )
+
+
+def test_compute_budget_bucketing_drop_slices() -> None:
+    """Dropping the slice bookkeeping keeps the batched data unchanged."""
+    from torch_geometric.data import Data
+    from graphnet.training.utils import collator_compute_budget_bucketing
+
+    torch.manual_seed(0)
+    lengths = [2, 3, 5, 8, 13, 4]
+    graphs = [
+        Data(x=torch.randn(n, 2), n_tokens=n, energy=torch.rand(1))
+        for n in lengths
+    ]
+    full = collator_compute_budget_bucketing(
+        max_compute=200, parameter="n_tokens", gamma=2.0
+    )(graphs)
+    lean = collator_compute_budget_bucketing(
+        max_compute=200, parameter="n_tokens", gamma=2.0, drop_slices=True
+    )(graphs)
+
+    assert len(full) == len(lean)
+    for a, b in zip(full, lean):
+        assert a.num_graphs == b.num_graphs
+        assert torch.equal(a.x, b.x)
+        assert torch.equal(a.batch, b.batch)
+        assert torch.equal(a.energy, b.energy)
+        assert len(a._slice_dict) > 0 and len(b._slice_dict) == 0
+        assert len(b._inc_dict) == 0
+
+
+def test_compute_budget_bucketing_node_counts() -> None:
+    """Each mini-batch lists its graphs' node counts, kept on the CPU."""
+    from torch_geometric.data import Data
+    from graphnet.training.utils import collator_compute_budget_bucketing
+
+    lengths = [2, 3, 5, 8, 13, 4]
+    graphs = [Data(x=torch.zeros(n, 2), n_tokens=n) for n in lengths]
+    batches = collator_compute_budget_bucketing(
+        max_compute=200, parameter="n_tokens", gamma=2.0, drop_slices=True
+    )(graphs)
+    for batch in batches:
+        assert batch.node_counts == torch.bincount(batch.batch).tolist()
+        moved = batch.to("cuda" if torch.cuda.is_available() else "cpu")
+        assert moved.node_counts == batch.node_counts  # still a plain list

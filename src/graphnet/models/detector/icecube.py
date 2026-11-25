@@ -246,8 +246,8 @@ class IceCubeBundleAdvanced(Detector):
         return x
 
 
-class IceCube86(Detector):
-    """`Detector` class for IceCube-86."""
+class IceCubeBundleLegacy(Detector):
+    """`Detector` class for IceCube-Bundle Rejection (former `IceCube86`)."""
 
     geometry_table_path = os.path.join(
         ICECUBE_GEOMETRY_TABLE_DIR, "icecube86.parquet"
@@ -299,7 +299,49 @@ class IceCube86(Detector):
         return (x - 1.0e04) / 3.0e4
 
     def _charge(self, x: torch.tensor) -> torch.tensor:
-        return torch.log10(x)
+        # floor charge at 1e-2; perturbation/noise can make it non-positive
+        return torch.log10(torch.clamp(x, min=1e-2))
+
+    def _rde(self, x: torch.tensor) -> torch.tensor:
+        return (x - 1.25) / 0.25
+
+    def _pmt_area(self, x: torch.tensor) -> torch.tensor:
+        return x / 0.05
+
+
+class IceCube86(Detector):
+    """`Detector` class for IceCube-86."""
+
+    geometry_table_path = os.path.join(
+        ICECUBE_GEOMETRY_TABLE_DIR, "icecube86.parquet"
+    )
+    xyz = ["dom_x", "dom_y", "dom_z"]
+    string_id_column = "string"
+    sensor_id_column = "sensor_id"
+
+    def feature_map(self) -> Dict[str, Callable]:
+        """Map standardization functions to each dimension of input data."""
+        feature_map = {
+            "dom_x": self._dom_xyz,
+            "dom_y": self._dom_xyz,
+            "dom_z": self._dom_xyz,
+            "dom_time": self._dom_time,
+            "charge": self._charge,
+            "rde": self._rde,
+            "pmt_area": self._pmt_area,
+            "hlc": self._identity,
+        }
+        return feature_map
+
+    def _dom_xyz(self, x: torch.tensor) -> torch.tensor:
+        return x / 500.0
+
+    def _dom_time(self, x: torch.tensor) -> torch.tensor:
+        return (x - 1.0e04) / 3.0e4
+
+    def _charge(self, x: torch.tensor) -> torch.tensor:
+        # floor charge at 1e-2; perturbation/noise can make it non-positive
+        return torch.log10(torch.clamp(x, min=1e-2))
 
     def _rde(self, x: torch.tensor) -> torch.tensor:
         return (x - 1.25) / 0.25

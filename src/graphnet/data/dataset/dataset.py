@@ -1,6 +1,7 @@
 """Base :py:class:`Dataset` class(es) used in GraphNeT."""
 
 from copy import deepcopy
+import itertools
 from abc import ABC, abstractmethod
 from typing import (
     cast,
@@ -20,6 +21,7 @@ import torch
 from torch_geometric.data import Data
 
 from graphnet.constants import GRAPHNET_ROOT_DIR
+from graphnet.data.augmentation import DataAugmentation
 from graphnet.data.utilities.string_selection_resolver import (
     StringSelectionResolver,
 )
@@ -91,6 +93,58 @@ def parse_labels(cfg: dict) -> Dict[str, Label]:
             **cfg["labels"][key]["arguments"]
         )
     return labels
+
+
+def _rows_to_array(rows: Any) -> Any:
+    """Convert query rows (a list of equal-length tuples) to a 2D array.
+
+    Same values as `np.asarray(rows)`, without building the intermediate
+    nested sequence: `np.fromiter` over the flattened rows is ~20% faster
+    for the many pulses of an event. Anything else (no rows, `None`
+    values, an array already) is returned as `np.asarray` would give it.
+    """
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or not isinstance(rows[0], tuple)
+    ):
+        return rows
+    n_columns = len(rows[0])
+    try:
+        array = np.fromiter(
+            itertools.chain.from_iterable(rows),
+            dtype=np.float64,
+            count=len(rows) * n_columns,
+        ).reshape(len(rows), n_columns)
+    except (TypeError, ValueError):  # e.g. ragged rows
+        return np.asarray(rows)
+    if np.isnan(array).any():
+        # `fromiter` turns NULL (None) into NaN; keep `np.asarray`'s result
+        return np.asarray(rows)
+    return array
+
+
+def parse_augmentations(cfg: dict) -> List[DataAugmentation]:
+    """Construct the data augmentations from DatasetConfig."""
+    assert cfg["augmentations"] is not None
+
+    augmentations = []
+    for augmentation in cfg["augmentations"]:
+        augmentations.append(
+            load_module(augmentation["class_name"])(
+                **augmentation["arguments"]
+            )
+        )
+    return augmentations
+
+
+def is_training_selection(selection_name: str) -> bool:
+    """Check whether the selection `selection_name` is used for training.
+
+    Training selections are shuffled by `DataLoader.from_dataset_config` and
+    are the only ones to which data augmentations are applied.
+    """
+    return "train" in selection_name.lower()
 
 
 class Dataset(
@@ -167,17 +221,15 @@ class Dataset(
         if cfg["labels"] is not None:
             cfg["labels"] = parse_labels(cfg)
 
+        if cfg.get("augmentations") is not None:
+            cfg["augmentations"] = parse_augmentations(cfg)
+
         if isinstance(cfg["path"], list):
             sources = []
-            msg = f"Constructing {len(cfg['path'])} datasets, with selection: {source.selection}"
-            msg_bool = True
-            for path in cfg["path"]:
+            for i, path in enumerate(cfg["path"]):
                 cfg["path"] = path
-                sources.append(source._dataset_class(**cfg, verbose=False))
-                if msg_bool:
-                    sources[-1].info(msg)
-                    msg_bool = False
-
+                # Log the selection once rather than for every file.
+                sources.append(source._dataset_class(**cfg, verbose=i == 0))
             source = EnsembleDataset(sources)
             return source
         else:
@@ -199,11 +251,20 @@ class Dataset(
         assert isinstance(config.selection, dict)
         datasets: Dict[str, "Dataset"] = {}
         selections: Dict[str, Union[str, List]] = deepcopy(config.selection)
+        augmentations = config.augmentations
         for key, selection in selections.items():
             config.selection = selection
+            # Augment the training selections only
+            if not is_training_selection(key):
+                config.augmentations = None
+            elif augmentations is not None:
+                Logger(log_folder=None).info(
+                    f"Applying data augmentations to selection '{key}'."
+                )
             dataset = Dataset.from_config(config)
             assert isinstance(dataset, (Dataset, EnsembleDataset))
             datasets[key] = dataset
+            config.augmentations = augmentations
 
         # Reset `selections`.
         config.selection = selections
@@ -255,7 +316,7 @@ class Dataset(
         data_representation: Optional[DataRepresentation] = None,
         node_truth: Optional[List[str]] = None,
         index_column: str = "event_no",
-        truth_table: str = "truth",
+        truth_table: Union[str, List[str]] = "truth",
         node_truth_table: Optional[str] = None,
         string_selection: Optional[List[int]] = None,
         selection: Optional[Union[str, List[int], List[List[int]]]] = None,
@@ -267,6 +328,7 @@ class Dataset(
         labels: Optional[Dict[str, Any]] = None,
         use_super_selection: bool = False,
         verbose: bool = True,
+        augmentations: Optional[List[DataAugmentation]] = None,
     ):
         """Construct Dataset.
 
@@ -285,7 +347,8 @@ class Dataset(
             index_column: Name of the column in the input files that contains
                 unique indicies to identify and map events across tables.
             truth_table: Name of the table containing event-level truth
-                information.
+                information, or a list of such tables, which are joined on
+                `index_column` (supported by `SQLiteDataset`).
             node_truth_table: Name of the table containing node-level truth
                 information.
             string_selection: Subset of strings for which data should be read
@@ -314,16 +377,22 @@ class Dataset(
                 events ~ event_no % 5 > 0"`).
             data_representation: Method that defines the data representation.
             labels: Dictionary of labels to be added to the dataset.
+            use_super_selection: If True, string selections are evaluated by
+                the dataset's query (e.g. as an SQL `WHERE` clause) instead
+                of with `pandas.DataFrame.query`, allowing backend functions
+                such as `exp` or `abs`. Disables the selection cache.
+            verbose: Whether to log the resolved selection.
+            augmentations: Data augmentations applied, in order, to the input
+                rows of every event each time it is read, before the data
+                representation (see `graphnet.data.augmentation`). Use them
+                for training data only. With a `DatasetConfig` that defines
+                several selections, they are applied to the selections whose
+                name contains "train". Defaults to None.
 
             graph_definition: Method that defines the graph representation.
                 NOTE: DEPRECATED Use `data_representation` instead.
                 # DEPRECATION: REMOVE AT 2.0 LAUNCH
                 # See https://github.com/graphnet-team/graphnet/issues/647
-            use_super_selection: If True, the string selection is handled by
-                the query function of the dataset class, rather than
-                pd.DataFrame.query. Defaults to False and should
-                only be used with sqlite.
-            verbose: Whether to print the selection info
         """
         # Base class constructor
         super().__init__(name=__name__, class_name=self.__class__.__name__)
@@ -357,8 +426,11 @@ class Dataset(
                     "will be deprecated in GraphNeT 2.0. "
                     "Please use `data_representation` instead."
                 )
-            else:
+            elif "LMDBDataset" not in [
+                cls.__name__ for cls in self.__class__.__mro__
+            ]:
                 # Code stops
+                # Check class hierarchy as string to avoid circular import
                 raise TypeError(
                     "__init__() missing 1 required keyword argument:"
                     "'data_representation'"
@@ -366,8 +438,14 @@ class Dataset(
 
         self._data_representation = deepcopy(data_representation)
         self._labels = labels
-        self._string_column = data_representation._detector.string_index_name
         self._use_super_selection = use_super_selection
+        self._augmentations = list(augmentations or [])
+        if data_representation is None:
+            self._string_column = None
+        else:
+            self._string_column = (
+                data_representation._detector.string_index_name
+            )
 
         if node_truth is not None:
             assert isinstance(node_truth_table, str)
@@ -434,8 +512,7 @@ class Dataset(
             self._indices = self._get_all_indices()
         elif isinstance(selection, str):
             self._indices = self._resolve_string_selection_to_indices(
-                selection,
-                verbose=verbose,
+                selection, verbose=verbose
             )
         else:
             self._indices = selection
@@ -450,8 +527,8 @@ class Dataset(
         return self._path
 
     @property
-    def truth_table(self) -> str:
-        """Name of the table containing event-level truth information."""
+    def truth_table(self) -> Union[str, List[str]]:
+        """Name(s) of the table(s) containing event-level truth."""
         return self._truth_table
 
     # DEPRECATION PROPERTY: REMOVE AT 2.0 LAUNCH
@@ -463,6 +540,11 @@ class Dataset(
             "DeprecationWarning: `_graph_definition` will be deprecated in"
             " GraphNeT 2.0. Please use `_data_representation` instead."
         )
+        if self._data_representation is None:
+            raise AttributeError(
+                "No data representation available. Provide a data "
+                "representation when constructing the dataset."
+            )
         return self._data_representation
 
     # Abstract method(s)
@@ -484,7 +566,7 @@ class Dataset(
     @abstractmethod
     def query_table(
         self,
-        table: str,
+        table: Union[str, List[str]],
         columns: Union[List[str], str],
         sequential_index: Optional[int] = None,
         selection: Optional[str] = None,
@@ -605,33 +687,23 @@ class Dataset(
         columns: List[str],
         table: Union[str, List[str]],
     ) -> List[str]:
-        """Return a list missing columns in `table`."""
+        """Return a list missing columns in `table`.
+
+        For a list of (joined) tables, a column counts as missing if it
+        is found in none of them.
+        """
+        key = table if isinstance(table, str) else ", ".join(table)
         for column in columns:
             try:
                 self.query_table(
                     table=table, columns=[column], sequential_index=0
                 )
             except ColumnMissingException:
-                if isinstance(table, str):
-                    if table not in self._missing_variables:
-                        self._missing_variables[table] = []
-                    self._missing_variables[table].append(column)
-                elif isinstance(table, list):
-                    for t in table:
-                        if t not in self._missing_variables:
-                            self._missing_variables[t] = []
-                        self._missing_variables[t].append(column)
+                self._missing_variables.setdefault(key, []).append(column)
             except IndexError:
                 self.warning(f"Dataset contains no entries for {column}")
-        if isinstance(table, str):
-            missing_variables = self._missing_variables.get(table, [])
-        elif isinstance(table, list):
-            missing_variables = [
-                value
-                for key, value in self._missing_variables.items()
-                if key in table
-            ]
-        return missing_variables
+
+        return self._missing_variables.get(key, [])
 
     def _query(
         self, sequential_index: int
@@ -657,7 +729,7 @@ class Dataset(
             features_pulsemap = self.query_table(
                 pulsemap, self._features, sequential_index, self._selection
             )
-            features.append(features_pulsemap)
+            features.append(_rows_to_array(features_pulsemap))
 
         if len(self._pulsemaps) > 0:
             features = np.concatenate(features, axis=0)
@@ -708,13 +780,10 @@ class Dataset(
         """
         # Convert truth to dict
         if len(truth.shape) == 1:
-            truth_dict = {
-                key: truth[0][index] for index, key in enumerate(self._truth)
-            }
-        else:
-            truth_dict = {
-                key: truth[:, index] for index, key in enumerate(self._truth)
-            }
+            truth = truth.reshape(1, -1)
+        truth_dict = {
+            key: truth[:, index] for index, key in enumerate(self._truth)
+        }
 
         # Define custom labels
         labels_dict = self._get_labels(truth_dict)
@@ -739,8 +808,18 @@ class Dataset(
             node_features = np.array([]).reshape((0, len(self._features)))
 
         assert isinstance(features, np.ndarray)
+        for augmentation in self._augmentations:
+            node_features = augmentation(node_features, self._features)
+
         # Construct graph data object
-        assert self._data_representation is not None
+        try:
+            assert self._data_representation is not None
+        except AssertionError:
+            raise AssertionError(
+                "Real-time computation of data representation requires "
+                "a data representation to be provided. Please provide a "
+                "data representation when initializing the dataset."
+            )
         graph = self._data_representation(
             input_features=node_features,
             input_feature_names=self._features,
